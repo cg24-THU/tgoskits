@@ -1,0 +1,174 @@
+Title:
+Integrate qperf profiling for StarryOS
+
+Description:
+## Summary
+
+This PR integrates the Starry-OS qperf profiler into the TGOSKits StarryOS workflow through a new `cargo starry perf` subcommand.
+
+The new command can build the bundled qperf plugin and analyzer, build the StarryOS debug kernel, prepare the QEMU/rootfs configuration, inject the QEMU TCG plugin, collect raw qperf samples, and generate folded stack output under `target/qperf`.
+
+Main user command:
+
+```bash
+cargo starry perf --arch riscv64
+```
+
+Supported options include:
+
+```text
+--arch <ARCH>
+--freq <N>
+--out <DIR>
+--format <folded|svg|pprof|all>
+--max-depth <N>
+--timeout <SECONDS>
+```
+
+## Changes
+
+- Added `cargo starry perf` to the StarryOS CLI.
+- Added qperf integration logic in `scripts/axbuild/src/starry/perf.rs`.
+- Bundled qperf under `tools/qperf` so users do not need to clone or configure qperf manually.
+- Automatically builds:
+  - `tools/qperf/target/release/libqperf.so`
+  - `tools/qperf/target/release/qperf-analyzer`
+- Reuses existing StarryOS build, rootfs, and patched QEMU configuration flow.
+- Injects qperf into QEMU through `-plugin libqperf.so,...`.
+- Generates:
+  - `qperf.bin`
+  - `stack.folded`
+  - `summary.txt`
+  - `flamegraph.svg` when a flamegraph generator is available
+- Added qperf runtime robustness fixes:
+  - replaced unbounded sample queue with bounded channel;
+  - uses non-blocking sample enqueue on the QEMU execution path;
+  - drops samples when the queue is full and records dropped sample counts;
+  - adds maximum stack depth control;
+  - validates frame pointer chains for zero, misalignment, non-progress, cycles, excessive depth, and read failures;
+  - uses buffered output for sample writing;
+  - avoids panics in sampling and writer paths.
+- Improved analyzer robustness:
+  - buffered I/O;
+  - symbol resolution cache;
+  - tolerant handling for empty stacks, unknown symbols, and trailing partial records;
+  - contextual errors for input, ELF, and output failures.
+- Added English and Chinese reports:
+  - `docs/qperf-starryos-integration-report.md`
+  - `qperf-starryos-integration-report.zh.md`
+
+## Usage Examples
+
+Generate folded stacks for riscv64:
+
+```bash
+cargo starry perf --arch riscv64 --timeout 20 --format folded --out target/qperf/repro-riscv64
+```
+
+Inspect output:
+
+```bash
+ls -lh target/qperf/repro-riscv64
+wc -l target/qperf/repro-riscv64/stack.folded
+grep -E 'ax_task|ax_mm|ax_plat|syscall|starry|starry_api' target/qperf/repro-riscv64/stack.folded | head
+cat target/qperf/repro-riscv64/summary.txt
+```
+
+Generate folded stacks and try to generate SVG flamegraph:
+
+```bash
+cargo starry perf --arch riscv64 --timeout 20 --format all --out target/qperf/repro-riscv64-all
+```
+
+If no flamegraph generator is installed, the command keeps `stack.folded` and exits successfully.
+
+Manual SVG generation:
+
+```bash
+inferno-flamegraph < target/qperf/repro-riscv64/stack.folded > target/qperf/repro-riscv64/flamegraph.svg
+```
+
+## Docker Verification
+
+All key verification was run in Docker image `b7c4600e825d`.
+
+Format and axbuild check:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work b7c4600e825d \
+  bash -lc 'cargo fmt --check && cargo check -p axbuild'
+```
+
+Result: passed.
+
+axbuild clippy:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work b7c4600e825d \
+  bash -lc 'cargo xtask clippy --package axbuild'
+```
+
+Result: passed, 4 checks passed.
+
+axbuild targeted tests:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work b7c4600e825d \
+  bash -lc 'cargo test -p axbuild'
+```
+
+Result: passed, 207 tests passed.
+
+qperf clippy:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work/tools/qperf b7c4600e825d \
+  bash -lc 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings'
+```
+
+Result: passed.
+
+Help output:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work b7c4600e825d \
+  bash -lc 'cargo starry perf --help'
+```
+
+Result: passed.
+
+riscv64 integrated profiling run:
+
+```bash
+docker run --rm -v "$PWD":/work -w /work b7c4600e825d \
+  bash -lc 'cargo starry perf --arch riscv64 --timeout 20 --format folded --out target/qperf/integration-riscv64-final'
+```
+
+Result: passed.
+
+Generated files:
+
+```text
+target/qperf/integration-riscv64-final/qemu.toml
+target/qperf/integration-riscv64-final/qperf.bin
+target/qperf/integration-riscv64-final/stack.folded
+target/qperf/integration-riscv64-final/summary.txt
+```
+
+The generated `stack.folded` was non-empty and contained StarryOS / ArceOS kernel symbols such as:
+
+```text
+ax_plat::call_main
+ax_task::api::current_may_uninit
+ax_mm::backend::Backend
+ax_page_table_multiarch
+```
+
+`--format all` was also tested. The Docker image did not include a flamegraph generator, so `flamegraph.svg` was not produced, but the command completed successfully and retained `stack.folded`.
+
+## Known Limitations
+
+- `cargo starry qemu --perf` is not implemented in this PR. The integration is currently exposed through the dedicated `cargo starry perf` subcommand to avoid changing existing `qemu` behavior.
+- `--format pprof` is reserved but not implemented yet.
+- loongarch64 is wired through the CLI and QEMU selection path, but full loongarch64 runtime validation was not completed in the current Docker environment.
+- If QEMU is terminated by an external timeout, the qperf plugin shutdown callback may not finish, so plugin-side final dropped sample metadata may be unavailable. The TGOSKits integration still writes `summary.txt`.

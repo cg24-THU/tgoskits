@@ -90,6 +90,10 @@ pub struct ArgsPerf {
     pub max_depth: usize,
     #[arg(long, value_name = "SECONDS", default_value_t = 20)]
     pub timeout: u64,
+    #[arg(long, value_name = "PREFIX")]
+    pub shell_prefix: Option<String>,
+    #[arg(long, value_name = "CMD")]
+    pub shell_init_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

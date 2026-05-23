@@ -3,10 +3,11 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context, bail};
+use ostool::run::qemu::QemuConfig;
 use serde::{Deserialize, Serialize};
 
 use super::{ArgsBuild, ArgsPerf, PerfFormat, Starry, build, rootfs};
@@ -77,15 +78,18 @@ pub(super) async fn run(starry: &mut Starry, args: ArgsPerf) -> anyhow::Result<(
     rootfs::ensure_qemu_rootfs_ready(&request, starry.app.workspace_root(), None).await?;
     let cargo = build::load_cargo_config(&request)?;
     let qemu = rootfs::load_patched_qemu_config(starry, &request, &cargo, None, true).await?;
-    write_qemu_config(&outputs, &tools, &args, qemu.args)?;
 
-    let kernel_bin = kernel_bin_path(starry.app.workspace_root(), &target);
-    let qemu_status = run_qemu_direct(&outputs, &args, &arch, &kernel_bin)?;
-    if !qemu_status.success() {
+    let perf_qemu = build_perf_qemu_config(&outputs, &tools, &args, qemu.args.clone());
+    write_qemu_config_file(&outputs, &perf_qemu)?;
+
+    // Disable debug mode so ostool doesn't add -s -S which would freeze the CPU
+    starry.app.set_debug_mode(false)?;
+    let result = starry.app.run_qemu(&cargo, perf_qemu).await;
+    if let Err(err) = &result {
         if !file_nonempty(&outputs.raw) {
-            bail!("qperf QEMU run failed before producing samples: {qemu_status}");
+            bail!("qperf QEMU run failed before producing samples: {err}");
         }
-        eprintln!("qperf: QEMU ended with {qemu_status} after producing samples");
+        eprintln!("qperf: QEMU ended with error after producing samples: {err}");
     }
 
     let elf = kernel_elf_path(starry.app.workspace_root(), &target);
@@ -107,7 +111,7 @@ pub(super) async fn run(starry: &mut Starry, args: ArgsPerf) -> anyhow::Result<(
         flamegraph_generated,
     )?;
     print_report(&outputs, flamegraph_generated);
-    Ok(())
+    result
 }
 
 fn validate_args(args: &ArgsPerf) -> anyhow::Result<()> {
@@ -120,7 +124,45 @@ fn validate_args(args: &ArgsPerf) -> anyhow::Result<()> {
     if matches!(args.format, PerfFormat::Pprof) {
         bail!("--format pprof is not supported yet; use --format folded, svg, or all");
     }
+    if args.shell_init_cmd.is_some() && args.shell_prefix.is_none() {
+        bail!("--shell-init-cmd requires --shell-prefix to detect the shell prompt");
+    }
     Ok(())
+}
+
+fn build_perf_qemu_config(
+    outputs: &PerfOutputs,
+    tools: &QperfTools,
+    args: &ArgsPerf,
+    qemu_args: Vec<String>,
+) -> QemuConfig {
+    let mut perf_qemu_args = vec!["-plugin".to_string()];
+    perf_qemu_args.push(format!(
+        "{},freq={},max_depth={},queue_size={},out={}",
+        tools.plugin.display(),
+        args.freq,
+        args.max_depth,
+        QPERF_QUEUE_SIZE,
+        outputs.raw.display()
+    ));
+    perf_qemu_args.extend(qemu_args);
+
+    let success_regex = if args.shell_init_cmd.is_some() {
+        vec!["BENCH_PASS".to_string()]
+    } else {
+        Vec::new()
+    };
+
+    QemuConfig {
+        args: perf_qemu_args,
+        uefi: false,
+        to_bin: true,
+        success_regex,
+        fail_regex: vec![r"(?i)\bpanic(?:ked)?\b".to_string()],
+        shell_prefix: args.shell_prefix.clone(),
+        shell_init_cmd: args.shell_init_cmd.clone(),
+        timeout: (args.timeout > 0).then_some(args.timeout),
+    }
 }
 
 fn prepare_outputs(root: &Path, arch: &str, out: Option<&Path>) -> anyhow::Result<PerfOutputs> {
@@ -177,76 +219,23 @@ fn build_qperf_tools(root: &Path) -> anyhow::Result<QperfTools> {
     Ok(tools)
 }
 
-fn write_qemu_config(
+fn write_qemu_config_file(
     outputs: &PerfOutputs,
-    tools: &QperfTools,
-    args: &ArgsPerf,
-    qemu_args: Vec<String>,
+    config: &QemuConfig,
 ) -> anyhow::Result<()> {
-    let mut perf_qemu_args = vec!["-plugin".to_string()];
-    perf_qemu_args.push(format!(
-        "{},freq={},max_depth={},queue_size={},out={}",
-        tools.plugin.display(),
-        args.freq,
-        args.max_depth,
-        QPERF_QUEUE_SIZE,
-        outputs.raw.display()
-    ));
-    perf_qemu_args.extend(qemu_args);
-
-    let config = PerfQemuConfig {
-        args: perf_qemu_args,
-        uefi: false,
-        to_bin: true,
-        success_regex: Vec::new(),
-        fail_regex: vec![r"(?i)\bpanic(?:ked)?\b".to_string()],
-        shell_prefix: None,
-        shell_init_cmd: None,
-        timeout: (args.timeout > 0).then_some(args.timeout),
+    let perf_config = PerfQemuConfig {
+        args: config.args.clone(),
+        uefi: config.uefi,
+        to_bin: config.to_bin,
+        success_regex: config.success_regex.clone(),
+        fail_regex: config.fail_regex.clone(),
+        shell_prefix: config.shell_prefix.clone(),
+        shell_init_cmd: config.shell_init_cmd.clone(),
+        timeout: config.timeout,
     };
-    fs::write(&outputs.qemu_config, toml::to_string_pretty(&config)?)
+    fs::write(&outputs.qemu_config, toml::to_string_pretty(&perf_config)?)
         .with_context(|| format!("failed to write {}", outputs.qemu_config.display()))?;
     Ok(())
-}
-
-fn run_qemu_direct(
-    outputs: &PerfOutputs,
-    args: &ArgsPerf,
-    arch: &str,
-    kernel_bin: &Path,
-) -> anyhow::Result<ExitStatus> {
-    ensure_file(kernel_bin, "StarryOS kernel image")?;
-    let qemu = qemu_executable(arch)?;
-    let qemu_args = qemu_args_from_config(&outputs.qemu_config)?;
-
-    let mut command = if args.timeout > 0 {
-        let mut command = Command::new("timeout");
-        command.arg(format!("{}s", args.timeout));
-        command.arg(qemu);
-        command
-    } else {
-        Command::new(qemu)
-    };
-
-    command.args(qemu_args).arg("-kernel").arg(kernel_bin);
-    eprintln!("running qperf QEMU: {command:?}");
-    command.status().context("failed to spawn QEMU")
-}
-
-fn qemu_executable(arch: &str) -> anyhow::Result<&'static str> {
-    match arch {
-        "riscv64" => Ok("qemu-system-riscv64"),
-        "loongarch64" => Ok("qemu-system-loongarch64"),
-        _ => bail!("qperf currently supports StarryOS riscv64 and loongarch64 only"),
-    }
-}
-
-fn qemu_args_from_config(path: &Path) -> anyhow::Result<Vec<String>> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read qperf QEMU config {}", path.display()))?;
-    let config: PerfQemuConfig = toml::from_str(&text)
-        .with_context(|| format!("failed to parse qperf QEMU config {}", path.display()))?;
-    Ok(config.args)
 }
 
 fn run_analyzer(analyzer: &Path, elf: &Path, raw: &Path, folded: &Path) -> anyhow::Result<()> {
@@ -333,6 +322,9 @@ fn write_summary(
     writeln!(file, "max_stack_depth = {}", args.max_depth)?;
     writeln!(file, "queue_size = {QPERF_QUEUE_SIZE}")?;
     writeln!(file, "timeout_seconds = {}", args.timeout)?;
+    if args.shell_init_cmd.is_some() {
+        writeln!(file, "shell_init_cmd = {}", args.shell_init_cmd.as_deref().unwrap())?;
+    }
     writeln!(file, "kernel_elf = {}", elf.display())?;
     writeln!(file, "plugin = {}", tools.plugin.display())?;
     writeln!(file, "analyzer = {}", tools.analyzer.display())?;
@@ -374,13 +366,6 @@ fn kernel_elf_path(root: &Path, target: &str) -> PathBuf {
         .join(target)
         .join("debug")
         .join("starryos")
-}
-
-fn kernel_bin_path(root: &Path, target: &str) -> PathBuf {
-    root.join("target")
-        .join(target)
-        .join("debug")
-        .join("starryos.bin")
 }
 
 fn ensure_file(path: &Path, label: &str) -> anyhow::Result<()> {
