@@ -2,9 +2,9 @@ use ax_errno::AxResult;
 use axnet::SocketOps;
 use linux_raw_sys::net::{sockaddr, socklen_t};
 
-use super::addr::SocketAddrExt;
+use super::addr::{SocketAddrExt, socket_addr_ex_for_user_name};
 use crate::{
-    file::{FileLike, Socket},
+    file::{FileLike, PacketSocket, Socket, netlink::NetlinkSocket},
     mm::UserPtr,
 };
 
@@ -13,8 +13,24 @@ pub fn sys_getsockname(
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
+    if let Ok(packet) = PacketSocket::from_fd(fd) {
+        let local_addr = packet.local_addr();
+        local_addr.write_to_user(
+            addr.address().as_usize() as *mut sockaddr,
+            addrlen.get_as_mut()?,
+        )?;
+        return Ok(0);
+    }
+
+    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
+        let local_addr = socket.local_addr();
+        debug!("sys_getsockname <= fd: {fd}, netlink_addr: {local_addr:?}");
+        super::addr::write_netlink_addr(&local_addr, addr, addrlen.get_as_mut()?)?;
+        return Ok(0);
+    }
+
     let socket = Socket::from_fd(fd)?;
-    let local_addr = socket.local_addr()?;
+    let local_addr = socket_addr_ex_for_user_name(socket.ip_domain(), socket.local_addr()?);
     debug!("sys_getsockname <= fd: {fd}, addr: {local_addr:?}");
 
     local_addr.write_to_user(addr, addrlen.get_as_mut()?)?;
@@ -27,7 +43,7 @@ pub fn sys_getpeername(
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
     let socket = Socket::from_fd(fd)?;
-    let peer_addr = socket.peer_addr()?;
+    let peer_addr = socket_addr_ex_for_user_name(socket.ip_domain(), socket.peer_addr()?);
     debug!("sys_getpeername <= fd: {fd}, addr: {peer_addr:?}");
 
     peer_addr.write_to_user(addr, addrlen.get_as_mut()?)?;

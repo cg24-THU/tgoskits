@@ -6,8 +6,8 @@
 //! be registered as the standard library's default allocator.
 
 #![no_std]
-#![cfg_attr(feature = "buddy-slab", feature(extern_item_impls))]
 
+#[allow(unused_imports)]
 #[macro_use]
 extern crate log;
 extern crate alloc;
@@ -53,10 +53,12 @@ impl Usages {
         Self([0; UsageKind::VARIANTS.len()])
     }
 
+    #[allow(dead_code)]
     fn alloc(&mut self, kind: UsageKind, size: usize) {
         self.0[kind as usize] += size;
     }
 
+    #[allow(dead_code)]
     fn dealloc(&mut self, kind: UsageKind, size: usize) {
         self.0[kind as usize] -= size;
     }
@@ -109,14 +111,6 @@ impl From<AllocError> for AxError {
             AllocError::InvalidParam | AllocError::NotAllocated => AxError::InvalidInput,
         }
     }
-}
-
-#[cfg(feature = "buddy-slab")]
-/// Platform hooks required by the buddy-slab backend.
-pub mod eii {
-    /// Translate a virtual address to a physical address.
-    #[eii(ax_alloc_virt_to_phys_impl)]
-    pub fn virt_to_phys(vaddr: usize) -> usize;
 }
 
 /// Unified allocator operations provided by all `ax-alloc` backends.
@@ -184,19 +178,23 @@ pub trait AllocatorOps {
     fn usages(&self) -> Usages;
 }
 
-// Select implementation based on features.
-#[cfg(feature = "buddy-slab")]
+// Select implementation based on build.rs-generated cfg flags.
+#[cfg(buddy_slab)]
 mod buddy_slab;
-#[cfg(feature = "buddy-slab")]
-use buddy_slab as imp;
+#[cfg(not(any(tlsf, buddy_slab)))]
+mod stub_impl;
+#[cfg(tlsf)]
+mod tlsf_impl;
 
-#[cfg(not(feature = "buddy-slab"))]
-mod default_impl;
-#[cfg(not(feature = "buddy-slab"))]
-use default_impl as imp;
-#[cfg(feature = "buddy-slab")]
-pub use imp::init_precpu_slab;
-pub use imp::{DefaultByteAllocator, GlobalAllocator, global_add_memory, global_init};
+#[cfg(buddy_slab)]
+use buddy_slab as imp;
+pub use imp::{
+    DefaultByteAllocator, GlobalAllocator, global_add_memory, global_init, init_percpu_slab,
+};
+#[cfg(not(any(tlsf, buddy_slab)))]
+use stub_impl as imp;
+#[cfg(tlsf)]
+use tlsf_impl as imp;
 
 /// Returns the reference to the global allocator.
 pub fn global_allocator() -> &'static GlobalAllocator {

@@ -31,7 +31,7 @@ impl VsockStreamTransport {
             conn_id: Mutex::new(None),
             connection: Mutex::new(None),
             state: StateLock::new(State::Idle),
-            general: GeneralOptions::new(),
+            general: GeneralOptions::new(1, 40, 0), // SOCK_STREAM
         }
     }
 
@@ -122,7 +122,7 @@ impl VsockTransportOps for VsockStreamTransport {
                 conn_id: Mutex::new(Some(conn_id)),
                 connection: Mutex::new(Some(conn)),
                 state: StateLock::new(State::Connected),
-                general: GeneralOptions::default(),
+                general: GeneralOptions::new(1, 40, 0), // SOCK_STREAM
             };
 
             Ok((VsockTransport::Stream(new_transport), peer_addr))
@@ -223,8 +223,9 @@ impl VsockTransportOps for VsockStreamTransport {
 
     fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
         let conn = self.get_connection()?;
+        let extra_nb = options.flags.contains(RecvFlags::DONTWAIT);
 
-        self.general.recv_poller(self, || {
+        self.general.recv_poller_with(self, extra_nb, || {
             let mut conn_guard = conn.lock();
 
             if conn_guard.rx_closed() && conn_guard.rx_buffer_used() == 0 {
@@ -342,10 +343,8 @@ impl Pollable for VsockStreamTransport {
         if let Ok(conn) = self.get_connection() {
             let mut conn = conn.lock();
             match conn.state() {
-                ConnectionState::Listening => {
-                    if events.contains(IoEvents::IN) {
-                        conn.register_accept_poll(context);
-                    }
+                ConnectionState::Listening if events.contains(IoEvents::IN) => {
+                    conn.register_accept_poll(context);
                 }
                 ConnectionState::Connected => {
                     if events.contains(IoEvents::IN) {
@@ -357,10 +356,8 @@ impl Pollable for VsockStreamTransport {
                         );
                     }
                 }
-                ConnectionState::Connecting => {
-                    if events.contains(IoEvents::OUT) {
-                        conn.register_connect_poll(context);
-                    }
+                ConnectionState::Connecting if events.contains(IoEvents::OUT) => {
+                    conn.register_connect_poll(context);
                 }
                 _ => {}
             }

@@ -57,15 +57,11 @@ impl ConfigValue {
     /// Updates the config value with a new value.
     pub fn update(&mut self, new_value: Self) -> ConfigResult<()> {
         match (&self.ty, &new_value.ty) {
-            (Some(ty), Some(new_ty)) => {
-                if ty != new_ty {
-                    return Err(ConfigErr::ValueTypeMismatch);
-                }
+            (Some(ty), Some(new_ty)) if ty != new_ty => {
+                return Err(ConfigErr::ValueTypeMismatch);
             }
-            (Some(ty), None) => {
-                if !value_type_matches(&new_value.value, ty) {
-                    return Err(ConfigErr::ValueTypeMismatch);
-                }
+            (Some(ty), None) if !value_type_matches(&new_value.value, ty) => {
+                return Err(ConfigErr::ValueTypeMismatch);
             }
             (None, Some(new_ty)) => {
                 if !value_type_matches(&self.value, new_ty) {
@@ -92,6 +88,11 @@ impl ConfigValue {
     /// Returns the TOML-formatted string of the config value.
     pub fn to_toml_value(&self) -> String {
         to_toml(&self.value)
+    }
+
+    /// Returns the raw string value if this config value is a TOML string.
+    pub fn as_str(&self) -> Option<&str> {
+        self.value.as_str()
     }
 
     /// Returns the Rust code of the config value.

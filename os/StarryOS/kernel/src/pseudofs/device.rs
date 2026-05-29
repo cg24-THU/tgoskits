@@ -13,13 +13,14 @@ use inherit_methods_macro::inherit_methods;
 use super::{SimpleFs, SimpleFsNode};
 
 /// Mmap behavior for devices.
+#[derive(Clone)]
 pub enum DeviceMmap {
-    /// The device is not mappable.
+    /// The device is not mappable (→ ENODEV, matches Linux).
     None,
+
     /// Maps to a physical address range.
     Physical(PhysAddrRange),
-    /// The device is read-only and will be mapped as CoW.
-    ReadOnly,
+
     /// Maps to a cached file.
     Cache(CachedFile),
 }
@@ -43,8 +44,12 @@ pub trait DeviceOps: Send + Sync {
         None
     }
 
-    /// Returns the memory mapping behavior of the device.
-    fn mmap(&self) -> DeviceMmap {
+    /// Returns the memory mapping behavior of the device for the given offset.
+    ///
+    /// # Arguments
+    /// * `offset` - The offset from the start of the device
+    /// * `length` - The length of the mapping
+    fn mmap(&self, _offset: u64, _length: u64) -> DeviceMmap {
         DeviceMmap::None
     }
 
@@ -52,6 +57,14 @@ pub trait DeviceOps: Send + Sync {
     fn flags(&self) -> NodeFlags {
         NodeFlags::empty()
     }
+
+    /// Called when the device is opened. `exclusive` is true if O_EXCL was set.
+    fn open(&self, _exclusive: bool) -> VfsResult<()> {
+        Ok(())
+    }
+
+    /// Called when the last file descriptor to this device is closed.
+    fn close(&self, _exclusive: bool) {}
 }
 
 /// A device node in the filesystem.
@@ -83,9 +96,9 @@ impl Device {
         self.node.metadata.lock().rdev = device_id;
     }
 
-    /// Returns the memory mapping behavior of the device.
-    pub fn mmap(&self) -> DeviceMmap {
-        self.ops.mmap()
+    /// Returns the memory mapping behavior of the device for the given offset.
+    pub fn mmap(&self, offset: u64, length: u64) -> DeviceMmap {
+        self.ops.mmap(offset, length)
     }
 }
 

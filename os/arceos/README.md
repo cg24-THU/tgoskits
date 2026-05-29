@@ -57,10 +57,10 @@ make A=examples/helloworld ARCH=aarch64 run
 
 #### 1. Install Build Dependencies
 
-Install [cargo-binutils](https://github.com/rust-embedded/cargo-binutils) to use `rust-objcopy` and `rust-objdump` tools, and [`ax-config-gen`](https://github.com/arceos-org/axconfig-gen) for kernel configuration, and [cargo-axplat](https://github.com/arceos-org/axplat_crates/tree/dev/cargo-axplat) for platform configuration:
+Install [cargo-binutils](https://github.com/rust-embedded/cargo-binutils) to use `rust-objcopy` and `rust-objdump` tools:
 
 ```bash
-cargo install cargo-binutils ax-config-gen cargo-axplat
+cargo install cargo-binutils
 ```
 
 ##### Dependencies for running apps
@@ -207,9 +207,9 @@ You may also need to select the corrsponding device drivers by setting the `FEAT
 
 ```bash
 # Build the shell app for raspi4, and use the SD card driver
-make MYPLAT=axplat-aarch64-raspi SMP=4 A=examples/shell FEATURES=page-alloc-4g,driver-bcm2835-sdhci BUS=mmio
+make MYPLAT=axplat-aarch64-raspi SMP=4 A=examples/shell FEATURES=page-alloc-4g,ax-driver/bcm2835-sdhci
 # Build httpserver for the bare-metal x86_64 platform, and use the ixgbe and ramdisk driver
-make PLAT_CONFIG=$(pwd)/configs/custom/x86_64-pc-oslab.toml A=examples/httpserver FEATURES=page-alloc-4g,driver-ixgbe,driver-ramdisk SMP=4
+make PLAT_CONFIG=$(pwd)/configs/custom/x86_64-pc-oslab.toml A=examples/httpserver FEATURES=page-alloc-4g,ax-driver/plat-static,ax-driver/ixgbe,ax-driver/ramdisk SMP=4
 ```
 
 ## How to reuse ArceOS modules in your own project

@@ -494,18 +494,6 @@ class GitSubtreeManager:
             url,
             branch,
         ]
-        # axdriver_crates has duplicate subtree join trailers in the shared
-        # history.  `git subtree push` scans those trailers before splitting and
-        # can fail with "cache for <hash> already exists!" unless we bypass join
-        # discovery via --ignore-joins.
-        use_ignore_joins = repo_name == 'axdriver_crates'
-        if use_ignore_joins:
-            print(
-                f"Using --ignore-joins for {repo_name} to avoid duplicate subtree history conflicts.",
-                flush=True,
-            )
-            push_args.insert(1, '--ignore-joins')
-
         cmd = self._git_subtree_cmd('push', push_args)
         try:
             self._run_command(cmd, env=subtree_env)
@@ -570,12 +558,12 @@ def cmd_add(args: argparse.Namespace) -> int:
     category = args.category or ""
     description = args.description or ""
 
-    # Add to CSV (skip if already exists)
-    added = csv_manager.add_repo(url, target_dir, branch, category, description, skip_if_exists=True)
-    if added:
-        print(f"Added to CSV: {url} -> {target_dir}")
-    else:
-        print(f"Repository already exists in CSV: {url}")
+    # Check working tree is clean before making any changes
+    if not git_manager.check_working_tree_clean():
+        print("Error: Working tree has uncommitted changes. "
+              "Please commit or stash your changes before adding a subtree.",
+              file=sys.stderr)
+        return 1
 
     # Add git subtree (this will check if already added to git)
     try:
@@ -584,6 +572,13 @@ def cmd_add(args: argparse.Namespace) -> int:
     except subprocess.CalledProcessError as e:
         print(f"Error adding git subtree: {e}", file=sys.stderr)
         return 1
+
+    # Add to CSV (skip if already exists)
+    added = csv_manager.add_repo(url, target_dir, branch, category, description, skip_if_exists=True)
+    if added:
+        print(f"Added to CSV: {url} -> {target_dir}")
+    else:
+        print(f"Repository already exists in CSV: {url}")
 
     return 0
 
@@ -967,9 +962,7 @@ Examples:
         description=(
             "Push local subtree changes to the configured remote branch.\n\n"
             "Notes:\n"
-            "  - axdriver_crates is pushed with --ignore-joins by default to avoid\n"
-            "    duplicate subtree history conflicts.\n"
-            "  - Other repositories automatically retry with --ignore-joins if\n"
+            "  - Repositories automatically retry with --ignore-joins if\n"
             "    git-subtree reports the known 'cache for <hash> already exists!'\n"
             "    error while scanning prior subtree joins."
         ),

@@ -43,6 +43,7 @@ pub struct TcpSocket {
     local_addr: UnsafeCell<IpEndpoint>,
     peer_addr: UnsafeCell<IpEndpoint>,
     nonblock: AtomicBool,
+    reuse_addr: AtomicBool,
 }
 
 unsafe impl Sync for TcpSocket {}
@@ -62,6 +63,7 @@ impl TcpSocket {
             local_addr: UnsafeCell::new(UNSPECIFIED_ENDPOINT),
             peer_addr: UnsafeCell::new(UNSPECIFIED_ENDPOINT),
             nonblock: AtomicBool::new(false),
+            reuse_addr: AtomicBool::new(false),
         }
     }
 
@@ -77,6 +79,7 @@ impl TcpSocket {
             local_addr: UnsafeCell::new(local_addr),
             peer_addr: UnsafeCell::new(peer_addr),
             nonblock: AtomicBool::new(false),
+            reuse_addr: AtomicBool::new(false),
         }
     }
 
@@ -121,6 +124,18 @@ impl TcpSocket {
         self.nonblock.store(nonblocking, Ordering::Release);
     }
 
+    /// Returns whether SO_REUSEADDR behavior is enabled.
+    #[inline]
+    pub fn is_reuse_addr(&self) -> bool {
+        self.reuse_addr.load(Ordering::Acquire)
+    }
+
+    /// Enables or disables SO_REUSEADDR behavior.
+    #[inline]
+    pub fn set_reuseaddr(&self, reuse: bool) {
+        self.reuse_addr.store(reuse, Ordering::Release);
+    }
+
     /// Connects to the given address and port.
     ///
     /// The local port is generated automatically.
@@ -132,11 +147,11 @@ impl TcpSocket {
 
             // TODO: check remote addr unreachable
             let bound_endpoint = self.bound_endpoint()?;
-            let iface = &ETH0.iface;
+            let mut iface = ETH0.iface.lock();
             let (local_endpoint, remote_endpoint) = SOCKET_SET
                 .with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
                     socket
-                        .connect(iface.lock().context(), remote_addr, bound_endpoint)
+                        .connect(iface.context(), remote_addr, bound_endpoint)
                         .or_else(|e| match e {
                             ConnectError::InvalidState => {
                                 ax_err!(BadState, "socket connect() failed")

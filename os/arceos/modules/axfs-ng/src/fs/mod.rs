@@ -1,5 +1,8 @@
-use ax_driver::AxBlockDevice;
+use alloc::boxed::Box;
+
 use axfs_ng_vfs::{Filesystem, VfsResult};
+
+use crate::block::{BlockRegion, FsBlockDevice};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "ext4")] {
@@ -11,13 +14,23 @@ cfg_if::cfg_if! {
     } else {
         struct DefaultFilesystem;
         impl DefaultFilesystem {
-            pub fn new(_dev: AxBlockDevice) -> VfsResult<Filesystem> {
+            pub fn new(_dev: Box<dyn FsBlockDevice>, _region: BlockRegion) -> VfsResult<Filesystem> {
                 panic!("No filesystem feature enabled");
             }
         }
     }
 }
 
-pub fn new_default(dev: AxBlockDevice) -> VfsResult<Filesystem> {
-    DefaultFilesystem::new(dev)
+/// Create a filesystem instance from a block device.
+pub fn new_default(dev: Box<dyn FsBlockDevice>, region: BlockRegion) -> VfsResult<Filesystem> {
+    DefaultFilesystem::new(dev, region)
+}
+
+/// Create a filesystem instance from a boxed block device.
+///
+/// Use this for loop devices and other block backends created outside the
+/// platform probe path.
+#[cfg(feature = "ext4")]
+pub fn new_from_dyn(dev: Box<dyn FsBlockDevice>, region: BlockRegion) -> VfsResult<Filesystem> {
+    ext4::Ext4Filesystem::new_from_boxed(dev, region)
 }

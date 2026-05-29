@@ -19,7 +19,7 @@ use core::{
 };
 
 use ax_errno::{AxError, AxResult};
-use ax_kspin::SpinNoPreempt;
+use ax_kspin::SpinNoIrq;
 use axpoll::{IoEvents, PollSet, Pollable};
 use bitflags::bitflags;
 use hashbrown::HashMap;
@@ -92,12 +92,21 @@ impl TriggerMode {
 }
 
 enum ConsumeResult {
-    // success and should keep in ready list
-    EventAndKeep(EpollEvent),
-    // success and hould remove ready list
-    EventAndRemove(EpollEvent),
+    Event {
+        event: EpollEvent,
+        old_mode: TriggerMode,
+        keep_ready: bool,
+    },
     // no event and should remove ready list
     NoEvent,
+}
+
+fn match_ready_events(current: IoEvents, interested: IoEvents) -> IoEvents {
+    (current & interested) | (current & IoEvents::ALWAYS_POLL)
+}
+
+fn register_events(interested: IoEvents) -> IoEvents {
+    interested | IoEvents::ALWAYS_POLL
 }
 
 #[derive(Clone)]
@@ -136,7 +145,7 @@ impl Eq for EntryKey {}
 struct EpollInterest {
     key: EntryKey,
     event: EpollEvent,
-    mode: SpinNoPreempt<TriggerMode>,
+    mode: SpinNoIrq<TriggerMode>,
     in_ready_queue: AtomicBool,
 }
 
@@ -145,7 +154,7 @@ impl EpollInterest {
         Self {
             key,
             event,
-            mode: SpinNoPreempt::new(TriggerMode::from_flags(flags)),
+            mode: SpinNoIrq::new(TriggerMode::from_flags(flags)),
             in_ready_queue: AtomicBool::new(false),
         }
     }
@@ -174,7 +183,7 @@ impl EpollInterest {
 
     fn consume(&self, file: &dyn FileLike) -> ConsumeResult {
         let current_events = file.poll();
-        let matched = current_events & self.event.events;
+        let matched = match_ready_events(current_events, self.event.events);
 
         // not ready
         if matched.is_empty() {
@@ -182,8 +191,8 @@ impl EpollInterest {
         }
 
         let mut mode = self.mode.lock();
+        let old_mode = *mode;
         let (should_notify, new_mode) = mode.should_notify();
-        *mode = new_mode;
         trace!(
             "consume fd: {} matches {:?} should notify: {} ",
             self.key.fd, matched, should_notify
@@ -193,17 +202,22 @@ impl EpollInterest {
             return ConsumeResult::NoEvent;
         }
 
-        // create event
+        *mode = new_mode;
+
         let event = EpollEvent {
             events: matched,
             user_data: self.event.user_data,
         };
 
-        // shoud still keep in ready?
-        match *mode {
-            TriggerMode::Level => ConsumeResult::EventAndKeep(event),
-            TriggerMode::Edge | TriggerMode::OneShot { .. } => ConsumeResult::EventAndRemove(event),
+        ConsumeResult::Event {
+            event,
+            old_mode,
+            keep_ready: matches!(*mode, TriggerMode::Level),
         }
+    }
+
+    fn restore_mode(&self, mode: TriggerMode) {
+        *self.mode.lock() = mode;
     }
 }
 
@@ -227,6 +241,10 @@ impl Wake for InterestWaker {
         };
 
         if interest.try_mark_in_queue() {
+            // The queue lock must disable IRQs because wakers may be invoked
+            // from IRQ wake paths. `VecDeque::push_back` can still allocate
+            // when capacity is exhausted; if this path is proven to run in IRQ
+            // context, replace the queue with a bounded or deferred design.
             epoll
                 .ready_queue
                 .lock()
@@ -241,16 +259,16 @@ impl Wake for InterestWaker {
 }
 
 struct EpollInner {
-    interests: SpinNoPreempt<HashMap<EntryKey, Arc<EpollInterest>>>,
-    ready_queue: SpinNoPreempt<VecDeque<Weak<EpollInterest>>>,
+    interests: SpinNoIrq<HashMap<EntryKey, Arc<EpollInterest>>>,
+    ready_queue: SpinNoIrq<VecDeque<Weak<EpollInterest>>>,
     poll_ready: PollSet,
 }
 
 impl Default for EpollInner {
     fn default() -> Self {
         Self {
-            interests: SpinNoPreempt::new(HashMap::new()),
-            ready_queue: SpinNoPreempt::new(VecDeque::new()),
+            interests: SpinNoIrq::new(HashMap::new()),
+            ready_queue: SpinNoIrq::new(VecDeque::new()),
             poll_ready: PollSet::new(),
         }
     }
@@ -282,7 +300,7 @@ impl Epoll {
         }));
 
         let mut context = Context::from_waker(&waker);
-        file.register(&mut context, interest.event.events);
+        file.register(&mut context, register_events(interest.event.events));
     }
 
     // for add/modify
@@ -300,15 +318,15 @@ impl Epoll {
             interest: Arc::downgrade(interest),
         }));
 
-        let current = file.poll() & interest.event.events;
+        let current = match_ready_events(file.poll(), interest.event.events);
 
         if !current.is_empty() {
             waker.wake_by_ref();
         } else {
             let mut context = Context::from_waker(&waker);
-            file.register(&mut context, interest.event.events);
+            file.register(&mut context, register_events(interest.event.events));
 
-            let current = file.poll() & interest.event.events;
+            let current = match_ready_events(file.poll(), interest.event.events);
             if !current.is_empty() {
                 waker.wake_by_ref();
             }
@@ -336,12 +354,28 @@ impl Epoll {
         let mut guard = self.inner.interests.lock();
         let old = guard.get_mut(&key).ok_or(AxError::NotFound)?;
 
-        // update new interest if old already in ready queue
-        if old.is_in_queue() {
+        // Preserve ready-queue membership across the swap. The ready_queue
+        // only holds Weak<EpollInterest> pointing at the old Arc, so
+        // dropping that Arc below turns those Weaks into dangling handles
+        // that upgrade() can't resolve. poll_events() would then silently
+        // skip the stale entry and the fd's pending event would be lost —
+        // which is how PostgreSQL's EPOLL_CTL_MOD after the first query
+        // ended up never waking the backend for the next client packet.
+        // Push a fresh Weak for the replacement interest so poll_events()
+        // still finds something to consume.
+        let was_in_queue = old.is_in_queue();
+        if was_in_queue {
             interest.in_ready_queue.store(true, Ordering::Release);
         }
         *old = Arc::clone(&interest);
         drop(guard);
+        if was_in_queue {
+            self.inner
+                .ready_queue
+                .lock()
+                .push_back(Arc::downgrade(&interest));
+            self.inner.poll_ready.wake();
+        }
         trace!(
             "Epoll: modify fd={}, events={:?}",
             fd, interest.event.events
@@ -362,22 +396,25 @@ impl Epoll {
         Ok(())
     }
 
-    pub fn poll_events(&self, out: &mut [epoll_event]) -> AxResult<usize> {
-        trace!("Epoll: poll_events called, out.len()={}", out.len());
+    pub fn poll_events_with(
+        &self,
+        max_events: usize,
+        mut put_event: impl FnMut(usize, epoll_event) -> AxResult<()>,
+    ) -> AxResult<usize> {
+        trace!("Epoll: poll_events_with called, max_events={max_events}");
+
+        // Splice the entire ready_queue into a local txlist, mirroring
+        // Linux's ep_send_events. Visiting each interest at most once per
+        // epoll_wait prevents the LT path from re-feeding the same fd back
+        // into the loop and filling out[] with duplicates of one ready fd.
+        let mut txlist = core::mem::take(&mut *self.inner.ready_queue.lock());
         let mut count = 0;
-        loop {
-            let weak_interest = {
-                let mut queue = self.inner.ready_queue.lock();
-                queue.pop_front()
-            };
+        let mut keep: VecDeque<Weak<EpollInterest>> = VecDeque::new();
 
-            let Some(weak_interest) = weak_interest else {
-                break;
-            };
-
-            if count >= out.len() {
-                self.inner.ready_queue.lock().push_front(weak_interest);
-                break;
+        while let Some(weak_interest) = txlist.pop_front() {
+            if count >= max_events {
+                keep.push_back(weak_interest);
+                continue;
             }
 
             let Some(interest) = weak_interest.upgrade() else {
@@ -397,31 +434,90 @@ impl Epoll {
             );
 
             match interest.consume(file.as_ref()) {
-                ConsumeResult::EventAndKeep(event) => {
-                    out[count] = epoll_event {
+                ConsumeResult::Event {
+                    event,
+                    old_mode,
+                    keep_ready,
+                } => {
+                    let event = epoll_event {
                         events: event.events.bits(),
                         data: event.user_data,
                     };
+
+                    if let Err(err) = put_event(count, event) {
+                        interest.restore_mode(old_mode);
+                        interest.in_ready_queue.store(true, Ordering::Release);
+                        let mut queue = self.inner.ready_queue.lock();
+                        queue.push_back(Arc::downgrade(&interest));
+                        queue.extend(txlist);
+                        queue.extend(keep);
+                        drop(queue);
+                        self.inner.poll_ready.wake();
+                        return if count == 0 { Err(err) } else { Ok(count) };
+                    }
+
                     count += 1;
-                    self.inner
-                        .ready_queue
-                        .lock()
-                        .push_back(Arc::downgrade(&interest));
-                }
-                ConsumeResult::EventAndRemove(event) => {
-                    out[count] = epoll_event {
-                        events: event.events.bits(),
-                        data: event.user_data,
-                    };
-                    count += 1;
-                    interest.mark_not_in_queue();
-                    self.register_waker_only(&interest);
+                    if keep_ready {
+                        keep.push_back(Arc::downgrade(&interest));
+                    } else {
+                        interest.mark_not_in_queue();
+                        // EPOLLET: install a fresh waker so the next edge
+                        // transition fires.  There is a race window between
+                        // mark_not_in_queue() above and register_waker_only()
+                        // below: the previous InterestWaker may have already
+                        // been consumed by the wake that delivered the event
+                        // we are returning here, leaving the underlying
+                        // PollSet empty.  If new data arrives in that gap,
+                        // poll_update.wake() hits the empty PollSet and the
+                        // notification is silently dropped — EPOLLET would
+                        // then never fire again because the new waker is
+                        // installed only after the data already arrived.
+                        // Close the window by re-checking the file's poll
+                        // state after registering and re-queueing the
+                        // interest directly if IN-side data is already
+                        // present.  EPOLLOUT is intentionally excluded: it
+                        // is normally always ready on writable sockets and
+                        // would cause a busy-loop.
+                        self.register_waker_only(&interest);
+                        let in_mask = interest.event.events
+                            & (IoEvents::IN | IoEvents::RDHUP | IoEvents::HUP);
+                        if !in_mask.is_empty()
+                            && let Some(f) = interest.key.get_file()
+                            && !(f.poll() & in_mask).is_empty()
+                            && interest.try_mark_in_queue()
+                        {
+                            self.inner
+                                .ready_queue
+                                .lock()
+                                .push_back(Arc::downgrade(&interest));
+                            self.inner.poll_ready.wake();
+                        }
+                    }
                 }
                 ConsumeResult::NoEvent => {
+                    // Spurious wakeup: the waker fired but file.poll() did
+                    // not match the interest mask (e.g. a shared PollSet
+                    // wake on a socket that has only EPOLLOUT ready when
+                    // the interest is for EPOLLIN).  Re-arm with a plain
+                    // waker registration — using check_and_register_waker
+                    // here would immediately re-queue the interest via
+                    // waker.wake_by_ref() whenever file.poll() is non-empty,
+                    // which a connected TCP socket (always EPOLLOUT-ready)
+                    // satisfies on every iteration, producing a tight loop
+                    // that fills the ready_queue with phantom events.
                     interest.mark_not_in_queue();
                     self.register_waker_only(&interest);
                 }
             }
+        }
+
+        if !keep.is_empty() {
+            let mut queue = self.inner.ready_queue.lock();
+            for entry in keep {
+                queue.push_back(entry);
+            }
+            drop(queue);
+            self.inner.poll_ready.wake();
         }
 
         if count == 0 {

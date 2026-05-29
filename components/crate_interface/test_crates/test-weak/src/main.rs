@@ -5,10 +5,7 @@
 //!
 //! Exit code 0 means all tests passed.
 
-#![feature(linkage)]
-
 use ax_crate_interface::call_interface;
-
 // Import the implementation crate to link the implementations
 use impl_weak_traits::{
     AllDefaultImpl, CallerWeakImpl, FullImpl, NamespacedWeakImpl, SelfRefFullImpl,
@@ -64,9 +61,14 @@ fn test_all_default_interface() {
 }
 
 fn test_namespaced_weak_interface() {
-    let id = call_interface!(namespace = WeakNs, define_weak_traits::NamespacedWeakIf::get_id);
-    let multiplier =
-        call_interface!(namespace = WeakNs, define_weak_traits::NamespacedWeakIf::get_default_multiplier);
+    let id = call_interface!(
+        namespace = WeakNs,
+        define_weak_traits::NamespacedWeakIf::get_id
+    );
+    let multiplier = call_interface!(
+        namespace = WeakNs,
+        define_weak_traits::NamespacedWeakIf::get_default_multiplier
+    );
 
     assert_eq!(id, 12345);
     assert_eq!(multiplier, 10);

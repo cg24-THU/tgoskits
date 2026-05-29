@@ -7,14 +7,14 @@ pub use ax_plat::mem::{
 };
 use ax_plat::mem::{check_sorted_ranges_overlap, ranges_difference};
 use heapless::Vec;
-use spin::Lazy;
+use spin::LazyLock;
 
 #[allow(unused_imports)]
 use crate::addr_of_sym;
 
 const MAX_REGIONS: usize = 128;
 
-static ALL_MEM_REGIONS: Lazy<Vec<PhysMemRegion, MAX_REGIONS>> = Lazy::new(|| {
+static ALL_MEM_REGIONS: LazyLock<Vec<PhysMemRegion, MAX_REGIONS>> = LazyLock::new(|| {
     let mut all_regions = Vec::new();
     let mut push = |r: PhysMemRegion| {
         if r.size > 0 {
@@ -108,6 +108,20 @@ static ALL_MEM_REGIONS: Lazy<Vec<PhysMemRegion, MAX_REGIONS>> = Lazy::new(|| {
 /// Returns an iterator over all physical memory regions.
 pub fn memory_regions() -> impl Iterator<Item = PhysMemRegion> {
     ALL_MEM_REGIONS.iter().cloned()
+}
+
+pub fn boot_stack_bounds(cpu_id: usize) -> (VirtAddr, usize) {
+    #[cfg(plat_dyn)]
+    {
+        axplat_dyn::boot_stack_bounds(cpu_id)
+    }
+    #[cfg(not(plat_dyn))]
+    {
+        let _ = cpu_id;
+        let bottom = addr_of_sym!(boot_stack);
+        let top = addr_of_sym!(boot_stack_top);
+        (VirtAddr::from(bottom), top - bottom)
+    }
 }
 
 /// Fills the `.bss` section with zeros.

@@ -1,6 +1,6 @@
 [package]
 name = "ax-std"
-version.workspace = true
+version = "0.5.15"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = [
@@ -40,21 +40,18 @@ plat-dyn = ["ax-feat/plat-dyn"]
 
 # Memory
 alloc = ["ax-api/alloc", "ax-feat/alloc", "ax-io/alloc"]
-alloc-tlsf = ["ax-feat/alloc-tlsf"]
-alloc-slab = ["ax-feat/alloc-slab"]
-alloc-buddy = ["ax-feat/alloc-buddy"]
-page-alloc-64g = ["ax-feat/page-alloc-64g"]                 # Support up to 64G memory capacity
-page-alloc-4g = ["ax-feat/page-alloc-4g"]                   # Support up to 4G memory capacity
 paging = ["ax-feat/paging", "alloc"]
 dma = ["ax-api/dma", "ax-feat/dma"]
 tls = ["ax-feat/tls"]
 
 # Multi-threading and scheduler
 multitask = ["ax-api/multitask", "ax-feat/multitask"]
+lockdep = ["ax-feat/lockdep"]
 task-ext = ["ax-feat/task-ext"]
 sched-fifo = ["ax-feat/sched-fifo"]
 sched-rr = ["ax-feat/sched-rr"]
 sched-cfs = ["ax-feat/sched-cfs"]
+stack-guard-page = ["multitask", "paging", "ax-feat/stack-guard-page"]
 
 # File system
 fs = ["ax-api/fs", "ax-feat/fs"]
@@ -74,17 +71,8 @@ input = ["ax-feat/input"]
 # Real Time Clock (RTC) Driver.
 rtc = ["ax-feat/rtc"]
 
-# Device drivers
-bus-mmio = ["ax-feat/bus-mmio"]
-bus-pci = ["ax-feat/bus-pci"]
-driver-ramdisk = ["ax-feat/driver-ramdisk"]
-driver-sdmmc = ["ax-feat/driver-sdmmc"]
-driver-ixgbe = ["ax-feat/driver-ixgbe"]
-driver-fxmac = ["ax-feat/driver-fxmac"]
-driver-bcm2835-sdhci = ["ax-feat/driver-bcm2835-sdhci"]
-driver-ahci = ["ax-feat/driver-ahci"]
-
 # Backtrace
+backtrace = ["ax-feat/backtrace"]
 dwarf = ["ax-feat/dwarf"]
 
 [dependencies]

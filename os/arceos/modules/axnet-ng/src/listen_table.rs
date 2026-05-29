@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::ops::DerefMut;
 
 use ax_errno::{AxError, AxResult};
@@ -18,23 +18,47 @@ const PORT_NUM: usize = 65536;
 
 struct ListenTableEntryInner {
     listen_endpoint: IpListenEndpoint,
-    syn_queue: VecDeque<SocketHandle>,
+    backlog: usize,
+    syn_queue: VecDeque<PendingTcp>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AcceptedTcp {
+    pub(crate) handle: SocketHandle,
+    pub(crate) local_endpoint: IpEndpoint,
+    pub(crate) remote_endpoint: IpEndpoint,
+}
+
+#[derive(Clone, Copy)]
+struct PendingTcp {
+    accepted: AcceptedTcp,
 }
 
 impl ListenTableEntryInner {
-    pub fn new(listen_endpoint: IpListenEndpoint) -> Self {
+    pub fn new(listen_endpoint: IpListenEndpoint, backlog: usize) -> Self {
+        let backlog = backlog.clamp(1, LISTEN_QUEUE_SIZE);
         Self {
             listen_endpoint,
-            syn_queue: VecDeque::with_capacity(LISTEN_QUEUE_SIZE),
+            backlog,
+            syn_queue: VecDeque::with_capacity(backlog),
         }
     }
-}
 
-impl Drop for ListenTableEntryInner {
-    fn drop(&mut self) {
-        for &handle in &self.syn_queue {
-            SOCKET_SET.remove(handle);
+    fn can_accept_endpoint(&self, dst: IpEndpoint) -> bool {
+        if self.listen_endpoint.port != dst.port {
+            return false;
         }
+        match self.listen_endpoint.addr {
+            Some(addr) => addr == dst.addr,
+            None => true,
+        }
+    }
+
+    fn into_handles(self) -> Vec<SocketHandle> {
+        self.syn_queue
+            .into_iter()
+            .map(|pending| pending.accepted.handle)
+            .collect()
     }
 }
 
@@ -60,12 +84,15 @@ impl ListenTable {
         self.tcp[port as usize].lock().is_none()
     }
 
-    pub fn listen(&self, listen_endpoint: IpListenEndpoint) -> AxResult {
+    pub fn listen(&self, listen_endpoint: IpListenEndpoint, backlog: usize) -> AxResult {
         let port = listen_endpoint.port;
         assert_ne!(port, 0);
         let mut entry = self.tcp[port as usize].lock();
         if entry.is_none() {
-            *entry = Some(Box::new(ListenTableEntryInner::new(listen_endpoint)));
+            *entry = Some(Box::new(ListenTableEntryInner::new(
+                listen_endpoint,
+                backlog,
+            )));
             Ok(())
         } else {
             warn!("socket already listening on port {port}");
@@ -75,23 +102,35 @@ impl ListenTable {
 
     pub fn unlisten(&self, port: u16) {
         debug!("TCP socket unlisten on {}", port);
-        *self.tcp[port as usize].lock() = None;
+        let handles = self.tcp[port as usize]
+            .lock()
+            .take()
+            .map(|entry| (*entry).into_handles())
+            .unwrap_or_default();
+        for handle in handles {
+            SOCKET_SET.remove(handle);
+        }
     }
 
     fn listen_entry(&self, port: u16) -> Arc<Mutex<Option<Box<ListenTableEntryInner>>>> {
         self.tcp[port as usize].clone()
     }
 
-    pub fn can_accept(&self, port: u16) -> AxResult<bool> {
+    // Callers pass the locked SocketSet to keep the global order:
+    // SERVICE -> SOCKET_SET -> listen entry.
+    pub fn can_accept(&self, port: u16, sockets: &SocketSet<'_>) -> AxResult<bool> {
         if let Some(entry) = self.listen_entry(port).lock().as_ref() {
-            Ok(entry.syn_queue.iter().any(|&handle| is_connected(handle)))
+            Ok(entry
+                .syn_queue
+                .iter()
+                .any(|pending| is_acceptable(sockets, pending.accepted.handle)))
         } else {
             warn!("accept before listen");
             Err(AxError::InvalidInput)
         }
     }
 
-    pub fn accept(&self, port: u16) -> AxResult<SocketHandle> {
+    pub fn accept(&self, port: u16, sockets: &mut SocketSet<'_>) -> AxResult<AcceptedTcp> {
         let entry = self.listen_entry(port);
         let mut table = entry.lock();
         let Some(entry) = table.deref_mut() else {
@@ -99,28 +138,28 @@ impl ListenTable {
             return Err(AxError::InvalidInput);
         };
 
-        let syn_queue: &mut VecDeque<SocketHandle> = &mut entry.syn_queue;
-        let idx = syn_queue
-            .iter()
-            .enumerate()
-            .find_map(|(idx, &handle)| is_connected(handle).then_some(idx))
-            .ok_or(AxError::WouldBlock)?; // wait for connection
-        if idx > 0 {
-            warn!(
-                "slow SYN queue enumeration: index = {}, len = {}!",
-                idx,
-                syn_queue.len()
-            );
+        let syn_queue: &mut VecDeque<PendingTcp> = &mut entry.syn_queue;
+        let mut idx = 0;
+        while idx < syn_queue.len() {
+            let handle = syn_queue[idx].accepted.handle;
+            if is_closed_without_data(sockets, handle) {
+                syn_queue.swap_remove_front(idx);
+                sockets.remove(handle);
+                continue;
+            }
+            if is_acceptable(sockets, handle) {
+                if idx > 0 {
+                    warn!(
+                        "slow SYN queue enumeration: index = {}, len = {}!",
+                        idx,
+                        syn_queue.len()
+                    );
+                }
+                return Ok(syn_queue.swap_remove_front(idx).unwrap().accepted);
+            }
+            idx += 1;
         }
-        let handle = syn_queue.swap_remove_front(idx).unwrap();
-        // If the connection is reset, return ConnectionReset error
-        // Otherwise, return the handle and the address tuple
-        if is_closed(handle) {
-            warn!("accept failed: connection reset");
-            Err(AxError::ConnectionReset)
-        } else {
-            Ok(handle)
-        }
+        Err(AxError::WouldBlock)
     }
 
     pub fn incoming_tcp_packet(
@@ -130,8 +169,10 @@ impl ListenTable {
         sockets: &mut SocketSet<'_>,
     ) {
         if let Some(entry) = self.listen_entry(dst.port).lock().deref_mut() {
-            // TODO(mivik): accept address check
-            if entry.syn_queue.len() >= LISTEN_QUEUE_SIZE {
+            if !entry.can_accept_endpoint(dst) {
+                return;
+            }
+            if entry.syn_queue.len() >= entry.backlog {
                 // SYN queue is full, drop the packet
                 warn!("SYN queue overflow!");
                 return;
@@ -153,18 +194,27 @@ impl ListenTable {
                 "TCP socket {}: prepare for connection {} -> {}",
                 handle, src, entry.listen_endpoint
             );
-            entry.syn_queue.push_back(handle);
+            entry.syn_queue.push_back(PendingTcp {
+                accepted: AcceptedTcp {
+                    handle,
+                    local_endpoint: dst,
+                    remote_endpoint: src,
+                },
+            });
         }
     }
 }
 
-fn is_connected(handle: SocketHandle) -> bool {
-    SOCKET_SET.with_socket::<tcp::Socket, _, _>(handle, |socket| {
-        !matches!(socket.state(), State::Listen | State::SynReceived)
-    })
+fn is_acceptable(sockets: &SocketSet<'_>, handle: SocketHandle) -> bool {
+    let socket: &tcp::Socket = sockets.get(handle);
+    match socket.state() {
+        State::Listen | State::SynReceived => false,
+        State::Closed => socket.recv_queue() > 0,
+        _ => true,
+    }
 }
 
-fn is_closed(handle: SocketHandle) -> bool {
-    SOCKET_SET
-        .with_socket::<tcp::Socket, _, _>(handle, |socket| matches!(socket.state(), State::Closed))
+fn is_closed_without_data(sockets: &SocketSet<'_>, handle: SocketHandle) -> bool {
+    let socket: &tcp::Socket = sockets.get(handle);
+    matches!(socket.state(), State::Closed) && socket.recv_queue() == 0
 }

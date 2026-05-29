@@ -41,7 +41,7 @@ pub fn generate_uuid_8() -> [u8; 16] {
 }
 
 pub fn debug_super_and_desc(superblock: &Ext4Superblock, fs: &Ext4FileSystem) {
-    debug!("Superblock info: {:?}", &superblock);
+    debug!("Superblock info: {:?}", superblock);
     debug!("Block group descriptors:");
     let desc = &fs.group_descs;
     for gid in desc {
@@ -69,7 +69,7 @@ pub fn is_numbers_power(number: usize, base: usize) -> bool {
     if tmp_number == 1 {
         return true;
     }
-    while tmp_number % base == 0 {
+    while tmp_number.is_multiple_of(base) {
         tmp_number /= base;
     }
     tmp_number == 1

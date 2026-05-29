@@ -60,17 +60,13 @@ impl Ext4Superblock {
     pub fn descs_per_block(&self) -> u32 {
         let block_size = self.block_size() as u32;
         let desc_size = self.s_desc_size as u32;
-        if desc_size == 0 {
-            0
-        } else {
-            block_size / desc_size
-        }
+        block_size.checked_div(desc_size).unwrap_or(0)
     }
 
     /// Returns the on-disk group descriptor size in bytes.
     pub fn get_desc_size(&self) -> u16 {
         if self.s_desc_size == 0 {
-            if self.has_feature_compat(Ext4Superblock::EXT4_FEATURE_INCOMPAT_64BIT) {
+            if self.has_feature_incompat(Ext4Superblock::EXT4_FEATURE_INCOMPAT_64BIT) {
                 return GROUP_DESC_SIZE;
             } else {
                 return GROUP_DESC_SIZE_OLD;
@@ -100,10 +96,16 @@ impl Ext4Superblock {
 
     /// Verifies the superblock checksum when `metadata_csum` is enabled.
     pub fn verify_superblock(&self) -> Ext4Result<Self> {
-        if ext4_superblock_has_metadata_csum(self)
-            && self.s_checksum != ext4_superblock_csum32(self)
-        {
-            return Err(Ext4Error::checksum());
+        if ext4_superblock_has_metadata_csum(self) {
+            let expected = ext4_superblock_csum32(self);
+            if self.s_checksum != expected {
+                log::error!(
+                    "Superblock checksum mismatch: stored={:#x} expected={:#x}",
+                    self.s_checksum,
+                    expected
+                );
+                return Err(Ext4Error::checksum());
+            }
         }
         Ok(*self)
     }

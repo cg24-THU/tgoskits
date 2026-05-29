@@ -7,15 +7,19 @@ use core::{
 };
 
 use ax_errno::{AxError, AxResult};
-use ax_fs::{FS_CONTEXT, FsContext};
+use ax_fs::{FS_CONTEXT, FileBackend, FileFlags, FsContext};
+use ax_io::{Seek, SeekFrom};
 use ax_sync::Mutex;
 use ax_task::future::{block_on, poll_io};
 use axfs_ng_vfs::{Location, Metadata, NodeFlags};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_EXCL};
 
 use super::{FileLike, Kstat, get_file_like};
-use crate::file::{IoDst, IoSrc};
+use crate::{
+    file::{IoDst, IoSrc},
+    pseudofs::Device,
+};
 
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
     let mut fs = FS_CONTEXT.lock();
@@ -57,21 +61,32 @@ pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> AxResult<Reso
             let file_like = get_file_like(dirfd)?;
             let f = file_like.clone();
             Ok(if let Some(file) = f.downcast_ref::<File>() {
-                ResolveAtResult::File(file.inner().backend()?.location().clone())
+                // Use location() directly: backend() rejects PATH-only fds
+                // (BadFileDescriptor) which would break fstat(O_PATH-fd).
+                // man "O_PATH": fstat(2) is in the allowed-operations list.
+                // Fixes bug-open-path-fstat-ebadf.
+                ResolveAtResult::File(file.inner().location().clone())
             } else if let Some(dir) = f.downcast_ref::<Directory>() {
                 ResolveAtResult::File(dir.inner().clone())
             } else {
                 ResolveAtResult::Other(file_like)
             })
         }
-        Some(path) => with_fs(dirfd, |fs| {
-            if flags & AT_SYMLINK_NOFOLLOW != 0 {
-                fs.resolve_no_follow(path)
+        Some(path) => {
+            let dirfd = if path.starts_with('/') {
+                AT_FDCWD
             } else {
-                fs.resolve(path)
-            }
-            .map(ResolveAtResult::File)
-        }),
+                dirfd
+            };
+            with_fs(dirfd, |fs| {
+                if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                    fs.resolve_no_follow(path)
+                } else {
+                    fs.resolve(path)
+                }
+                .map(ResolveAtResult::File)
+            })
+        }
     }
 }
 
@@ -99,21 +114,35 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
 /// File wrapper for `ax_fs::fops::File`.
 pub struct File {
     inner: ax_fs::File,
+    open_flags: u32,
     nonblock: AtomicBool,
+    append: AtomicBool,
 }
 
 impl File {
-    pub fn new(inner: ax_fs::File) -> Self {
+    pub fn new(inner: ax_fs::File, open_flags: u32) -> Self {
         Self {
             inner,
+            open_flags,
             nonblock: AtomicBool::new(false),
+            append: AtomicBool::new(open_flags & O_APPEND != 0),
         }
     }
 
     pub fn inner(&self) -> &ax_fs::File {
         &self.inner
     }
+}
 
+impl Drop for File {
+    fn drop(&mut self) {
+        if let Ok(device) = self.inner.location().entry().downcast::<Device>() {
+            device.inner().close(self.open_flags & O_EXCL != 0);
+        }
+    }
+}
+
+impl File {
     fn is_blocking(&self) -> bool {
         self.inner.location().flags().contains(NodeFlags::BLOCKING)
     }
@@ -137,22 +166,41 @@ impl FileLike for File {
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        let inner = self.inner();
-        if likely(self.is_blocking()) {
+        let mut inner = self.inner();
+        if self.append() {
+            inner.seek(SeekFrom::End(0))?;
+        }
+        let result = if likely(self.is_blocking()) {
             inner.write(src)
         } else {
             block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
                 inner.write(&mut *src)
             }))
+        };
+        if let Ok(bytes) = result
+            && bytes > 0
+        {
+            let path = path_for(inner.location()).into_owned();
+            crate::file::inotify::notify_modify_path(&path);
         }
+        result
     }
 
     fn stat(&self) -> AxResult<Kstat> {
         Ok(metadata_to_kstat(&self.inner().location().metadata()?))
     }
 
+    fn inode_key(&self) -> Option<(u64, u64)> {
+        let m = self.inner().location().metadata().ok()?;
+        Some((m.device, m.inode))
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
         self.inner().backend()?.location().ioctl(cmd, arg)
+    }
+
+    fn file_mmap(&self) -> AxResult<(FileBackend, FileFlags)> {
+        Ok((self.inner().backend()?.clone(), self.inner().flags()))
     }
 
     fn set_nonblocking(&self, flag: bool) -> AxResult {
@@ -164,6 +212,20 @@ impl FileLike for File {
         self.nonblock.load(Ordering::Acquire)
     }
 
+    fn append(&self) -> bool {
+        self.append.load(Ordering::Acquire)
+    }
+
+    fn set_append(&self, flag: bool) -> AxResult {
+        self.append.store(flag, Ordering::Release);
+        self.inner().set_flag(FileFlags::APPEND, flag);
+        Ok(())
+    }
+
+    fn open_flags(&self) -> u32 {
+        self.open_flags
+    }
+
     fn path(&self) -> Cow<'_, str> {
         path_for(self.inner.location())
     }
@@ -172,12 +234,22 @@ impl FileLike for File {
     where
         Self: Sized + 'static,
     {
-        get_file_like(fd)?.downcast_arc().map_err(|any| {
-            if any.is::<Directory>() {
-                AxError::IsADirectory
-            } else {
-                AxError::BrokenPipe
-            }
+        let any = get_file_like(fd)?;
+        if let Ok(file) = any.clone().downcast_arc::<File>() {
+            return Ok(file);
+        }
+        // Memfd wraps a regular File and is meant to behave as one for
+        // every read-data / size-changing syscall (lseek, fallocate,
+        // sendfile, pread, pwrite, ...). Hand back the inner File so
+        // those paths don't trip on the wrapper. Seal-aware ftruncate
+        // already takes a separate Memfd::from_fd branch upstream.
+        if let Ok(memfd) = any.clone().downcast_arc::<crate::file::memfd::Memfd>() {
+            return Ok(memfd.inner().clone());
+        }
+        Err(if any.is::<Directory>() {
+            AxError::IsADirectory
+        } else {
+            AxError::InvalidInput
         })
     }
 }
@@ -195,13 +267,18 @@ impl Pollable for File {
 pub struct Directory {
     inner: Location,
     pub offset: Mutex<u64>,
+    /// Original open flags (used by fd_is_path / sys_fchmodat to detect
+    /// O_PATH on directory descriptors — open(dir, O_PATH|O_DIRECTORY)
+    /// must reject fchmod just like O_PATH on a regular file).
+    open_flags: u32,
 }
 
 impl Directory {
-    pub fn new(inner: Location) -> Self {
+    pub fn new(inner: Location, open_flags: u32) -> Self {
         Self {
             inner,
             offset: Mutex::new(0),
+            open_flags,
         }
     }
 
@@ -213,15 +290,27 @@ impl Directory {
 
 impl FileLike for Directory {
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
-        Err(AxError::BadFileDescriptor)
+        Err(AxError::IsADirectory)
     }
 
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
+        // Directories cannot be opened for writing, so any write attempt
+        // means the fd is not open for writing → EBADF.
+        // Linux VFS checks FMODE_WRITE before reaching the filesystem layer.
         Err(AxError::BadFileDescriptor)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
         Ok(metadata_to_kstat(&self.inner.metadata()?))
+    }
+
+    fn inode_key(&self) -> Option<(u64, u64)> {
+        let m = self.inner.metadata().ok()?;
+        Some((m.device, m.inode))
+    }
+
+    fn open_flags(&self) -> u32 {
+        self.open_flags
     }
 
     fn path(&self) -> Cow<'_, str> {

@@ -18,7 +18,28 @@ pub fn sys_getppid() -> AxResult<isize> {
 }
 
 pub fn sys_gettid() -> AxResult<isize> {
-    Ok(current().id().as_u64() as _)
+    // `Thread::tid` rather than the scheduler ID: after a non-leader
+    // `execve` they differ (the calling thread inherits the leader's TID
+    // so that `gettid() == getpid()` holds in the new image).
+    Ok(current().as_thread().tid() as _)
+}
+
+/// `getcpu(2)`: report the CPU and NUMA node the caller is running on.
+///
+/// glibc's `sched_getcpu` and NUMA-aware allocators query this. We report the
+/// current CPU id and node 0 (single NUMA node); the obsolete `tcache` arg is
+/// ignored. Either pointer may be NULL.
+pub fn sys_getcpu(cpu: *mut u32, node: *mut u32, _tcache: usize) -> AxResult<isize> {
+    use ax_runtime::hal::percpu::this_cpu_id;
+    use starry_vm::VmMutPtr;
+
+    if !cpu.is_null() {
+        cpu.vm_write(this_cpu_id() as u32)?;
+    }
+    if !node.is_null() {
+        node.vm_write(0)?;
+    }
+    Ok(0)
 }
 
 /// ARCH_PRCTL codes
@@ -49,13 +70,14 @@ enum ArchPrctlCode {
 /// The set_tid_address() always succeeds
 pub fn sys_set_tid_address(clear_child_tid: usize) -> AxResult<isize> {
     let curr = current();
-    curr.as_thread().set_clear_child_tid(clear_child_tid);
-    Ok(curr.id().as_u64() as isize)
+    let thr = curr.as_thread();
+    thr.set_clear_child_tid(clear_child_tid);
+    Ok(thr.tid() as isize)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_arch_prctl(
-    uctx: &mut ax_hal::uspace::UserContext,
+    uctx: &mut ax_runtime::hal::cpu::uspace::UserContext,
     code: i32,
     addr: usize,
 ) -> AxResult<isize> {

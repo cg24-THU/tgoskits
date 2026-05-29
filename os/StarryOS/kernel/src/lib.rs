@@ -3,7 +3,6 @@
 
 #![no_std]
 #![feature(likely_unlikely)]
-#![feature(bstr)]
 #![allow(missing_docs)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -13,12 +12,25 @@ extern crate ax_runtime;
 #[macro_use]
 extern crate ax_log;
 
+#[macro_use]
+pub mod dyn_debug; // Re-export debug macros for use in other modules. It will override the `debug` macro from `log` crate when `dynamic_debug` feature is enabled.
+
 pub mod entry;
 
+mod cgroup;
 mod config;
+#[cfg(feature = "ebpf")]
+mod ebpf;
 mod file;
+mod kmod_loader;
+mod kprobe;
 mod mm;
+#[cfg(feature = "ebpf")]
+mod perf_event;
 mod pseudofs;
+mod stop_machine;
 mod syscall;
 mod task;
 mod time;
+mod tracepoint;
+mod trap;

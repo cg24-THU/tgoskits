@@ -6,18 +6,16 @@ use core::{
     task::Context,
 };
 
-#[cfg(feature = "vsock")]
-use ax_driver::prelude::VsockAddr;
 use ax_errno::{AxError, AxResult, LinuxError};
 use ax_io::prelude::*;
 use axpoll::{IoEvents, Pollable};
 use bitflags::bitflags;
-use enum_dispatch::enum_dispatch;
 
 #[cfg(feature = "vsock")]
-use crate::vsock::VsockSocket;
+use crate::vsock::{VsockAddr, VsockSocket};
 use crate::{
     options::{Configurable, GetSocketOption, SetSocketOption},
+    raw::RawSocket,
     tcp::TcpSocket,
     udp::UdpSocket,
     unix::{UnixSocket, UnixSocketAddr},
@@ -70,9 +68,29 @@ impl SocketAddrEx {
 bitflags! {
     /// Flags for sending data to a socket.
     ///
+    /// These values match Linux MSG_* constants so that `from_bits_retain(flags)`
+    /// from the syscall layer preserves the correct flags.
+    ///
     /// See [`SocketOps::send`].
     #[derive(Default, Debug, Clone, Copy)]
     pub struct SendFlags: u32 {
+        /// Sends out-of-band data on sockets that support it (e.g. SOCK_STREAM).
+        const OOB = 0x01;
+        /// Don't use a gateway to send the packet, send to hosts only on
+        /// directly connected networks.
+        const DONTROUTE = 0x04;
+        /// Enables nonblocking operation; if the operation would block,
+        /// `EAGAIN` or `EWOULDBLOCK` is returned.
+        const DONTWAIT = 0x40;
+        /// Terminates a record (SOCK_SEQPACKET).
+        const EOR = 0x80;
+        /// Sends only if a connection confirm is pending (UDP/RAW, Linux specific).
+        const CONFIRM = 0x800;
+        /// Requests not to send SIGPIPE on errors on stream oriented sockets
+        /// when the other end breaks the connection.
+        const NOSIGNAL = 0x4000;
+        /// More data will be sent; used to cork/coalesce sends (UDP/TCP).
+        const MORE = 0x8000;
     }
 }
 
@@ -88,6 +106,9 @@ bitflags! {
         /// the real size of the datagram, even when it is larger than the
         /// buffer.
         const TRUNCATE = 0x02;
+        /// Per-call non-blocking override (`MSG_DONTWAIT`). Does NOT
+        /// change the socket's own `O_NONBLOCK` state.
+        const DONTWAIT = 0x40;
     }
 }
 
@@ -118,6 +139,8 @@ pub struct RecvOptions<'a> {
     pub flags: RecvFlags,
     /// If set, ancillary control messages are appended here.
     pub cmsg: Option<&'a mut Vec<CMsgData>>,
+    /// If set and the datagram was truncated, this is set to `true`.
+    pub truncated: Option<&'a mut bool>,
 }
 impl Debug for RecvOptions<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -151,7 +174,6 @@ impl Shutdown {
 }
 
 /// Operations that can be performed on a socket.
-#[enum_dispatch]
 pub trait SocketOps: Configurable {
     /// Binds an unbound socket to the given address and port.
     fn bind(&self, local_addr: SocketAddrEx) -> AxResult;
@@ -159,7 +181,7 @@ pub trait SocketOps: Configurable {
     fn connect(&self, remote_addr: SocketAddrEx) -> AxResult;
 
     /// Starts listening on the bound address and port.
-    fn listen(&self) -> AxResult {
+    fn listen(&self, _backlog: usize) -> AxResult {
         Err(AxError::OperationNotSupported)
     }
     /// Accepts a connection on a listening socket, returning a new socket.
@@ -171,6 +193,10 @@ pub trait SocketOps: Configurable {
     fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize>;
     /// Receive data from the socket.
     fn recv(&self, dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize>;
+    /// Returns the number of bytes that can be read without blocking.
+    fn recv_available(&self) -> AxResult<usize> {
+        Err(AxError::OperationNotSupported)
+    }
 
     /// Get the local endpoint of the socket.
     fn local_addr(&self) -> AxResult<SocketAddrEx>;
@@ -181,18 +207,222 @@ pub trait SocketOps: Configurable {
     fn shutdown(&self, how: Shutdown) -> AxResult;
 }
 
+impl<T: SocketOps + ?Sized> SocketOps for Box<T> {
+    fn bind(&self, local_addr: SocketAddrEx) -> AxResult {
+        (**self).bind(local_addr)
+    }
+
+    fn connect(&self, remote_addr: SocketAddrEx) -> AxResult {
+        (**self).connect(remote_addr)
+    }
+
+    fn listen(&self, backlog: usize) -> AxResult {
+        (**self).listen(backlog)
+    }
+
+    fn accept(&self) -> AxResult<Socket> {
+        (**self).accept()
+    }
+
+    fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
+        (**self).send(src, options)
+    }
+
+    fn recv(&self, dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize> {
+        (**self).recv(dst, options)
+    }
+
+    fn recv_available(&self) -> AxResult<usize> {
+        (**self).recv_available()
+    }
+
+    fn local_addr(&self) -> AxResult<SocketAddrEx> {
+        (**self).local_addr()
+    }
+
+    fn peer_addr(&self) -> AxResult<SocketAddrEx> {
+        (**self).peer_addr()
+    }
+
+    fn shutdown(&self, how: Shutdown) -> AxResult {
+        (**self).shutdown(how)
+    }
+}
+
 /// Network socket abstraction.
-#[enum_dispatch(Configurable, SocketOps)]
 pub enum Socket {
     /// UDP socket.
-    Udp(UdpSocket),
+    Udp(Box<UdpSocket>),
     /// TCP socket.
-    Tcp(TcpSocket),
+    Tcp(Box<TcpSocket>),
+    /// Raw IP socket.
+    Raw(Box<RawSocket>),
     /// Unix domain socket.
-    Unix(UnixSocket),
+    Unix(Box<UnixSocket>),
     /// Virtio socket.
     #[cfg(feature = "vsock")]
-    Vsock(VsockSocket),
+    Vsock(Box<VsockSocket>),
+}
+
+impl From<UdpSocket> for Socket {
+    fn from(socket: UdpSocket) -> Self {
+        Self::Udp(Box::new(socket))
+    }
+}
+
+impl From<TcpSocket> for Socket {
+    fn from(socket: TcpSocket) -> Self {
+        Self::Tcp(Box::new(socket))
+    }
+}
+
+impl From<UnixSocket> for Socket {
+    fn from(socket: UnixSocket) -> Self {
+        Self::Unix(Box::new(socket))
+    }
+}
+
+#[cfg(feature = "vsock")]
+impl From<VsockSocket> for Socket {
+    fn from(socket: VsockSocket) -> Self {
+        Self::Vsock(Box::new(socket))
+    }
+}
+
+impl Configurable for Socket {
+    fn get_option_inner(&self, opt: &mut GetSocketOption) -> AxResult<bool> {
+        match self {
+            Socket::Tcp(tcp) => tcp.get_option_inner(opt),
+            Socket::Udp(udp) => udp.get_option_inner(opt),
+            Socket::Raw(raw) => raw.get_option_inner(opt),
+            Socket::Unix(unix) => unix.get_option_inner(opt),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.get_option_inner(opt),
+        }
+    }
+
+    fn set_option_inner(&self, opt: SetSocketOption) -> AxResult<bool> {
+        match self {
+            Socket::Tcp(tcp) => tcp.set_option_inner(opt),
+            Socket::Udp(udp) => udp.set_option_inner(opt),
+            Socket::Raw(raw) => raw.set_option_inner(opt),
+            Socket::Unix(unix) => unix.set_option_inner(opt),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.set_option_inner(opt),
+        }
+    }
+}
+
+impl SocketOps for Socket {
+    fn bind(&self, local_addr: SocketAddrEx) -> AxResult {
+        match self {
+            Socket::Tcp(tcp) => tcp.bind(local_addr),
+            Socket::Udp(udp) => udp.bind(local_addr),
+            Socket::Raw(raw) => raw.bind(local_addr),
+            Socket::Unix(unix) => unix.bind(local_addr),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.bind(local_addr),
+        }
+    }
+
+    fn connect(&self, remote_addr: SocketAddrEx) -> AxResult {
+        match self {
+            Socket::Tcp(tcp) => tcp.connect(remote_addr),
+            Socket::Udp(udp) => udp.connect(remote_addr),
+            Socket::Raw(raw) => raw.connect(remote_addr),
+            Socket::Unix(unix) => unix.connect(remote_addr),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.connect(remote_addr),
+        }
+    }
+
+    fn listen(&self, backlog: usize) -> AxResult {
+        match self {
+            Socket::Tcp(tcp) => tcp.listen(backlog),
+            Socket::Udp(udp) => udp.listen(backlog),
+            Socket::Raw(raw) => raw.listen(backlog),
+            Socket::Unix(unix) => unix.listen(backlog),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.listen(backlog),
+        }
+    }
+
+    fn accept(&self) -> AxResult<Socket> {
+        match self {
+            Socket::Tcp(tcp) => tcp.accept(),
+            Socket::Udp(udp) => udp.accept(),
+            Socket::Raw(raw) => raw.accept(),
+            Socket::Unix(unix) => unix.accept(),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.accept(),
+        }
+    }
+
+    fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
+        match self {
+            Socket::Tcp(tcp) => tcp.send(src, options),
+            Socket::Udp(udp) => udp.send(src, options),
+            Socket::Raw(raw) => raw.send(src, options),
+            Socket::Unix(unix) => unix.send(src, options),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.send(src, options),
+        }
+    }
+
+    fn recv(&self, dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize> {
+        match self {
+            Socket::Tcp(tcp) => tcp.recv(dst, options),
+            Socket::Udp(udp) => udp.recv(dst, options),
+            Socket::Raw(raw) => raw.recv(dst, options),
+            Socket::Unix(unix) => unix.recv(dst, options),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.recv(dst, options),
+        }
+    }
+
+    fn recv_available(&self) -> AxResult<usize> {
+        match self {
+            Socket::Tcp(tcp) => tcp.recv_available(),
+            Socket::Udp(udp) => udp.recv_available(),
+            Socket::Raw(raw) => raw.recv_available(),
+            Socket::Unix(unix) => unix.recv_available(),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.recv_available(),
+        }
+    }
+
+    fn local_addr(&self) -> AxResult<SocketAddrEx> {
+        match self {
+            Socket::Tcp(tcp) => tcp.local_addr(),
+            Socket::Udp(udp) => udp.local_addr(),
+            Socket::Raw(raw) => raw.local_addr(),
+            Socket::Unix(unix) => unix.local_addr(),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.local_addr(),
+        }
+    }
+
+    fn peer_addr(&self) -> AxResult<SocketAddrEx> {
+        match self {
+            Socket::Tcp(tcp) => tcp.peer_addr(),
+            Socket::Udp(udp) => udp.peer_addr(),
+            Socket::Raw(raw) => raw.peer_addr(),
+            Socket::Unix(unix) => unix.peer_addr(),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.peer_addr(),
+        }
+    }
+
+    fn shutdown(&self, how: Shutdown) -> AxResult {
+        match self {
+            Socket::Tcp(tcp) => tcp.shutdown(how),
+            Socket::Udp(udp) => udp.shutdown(how),
+            Socket::Raw(raw) => raw.shutdown(how),
+            Socket::Unix(unix) => unix.shutdown(how),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.shutdown(how),
+        }
+    }
 }
 
 impl Pollable for Socket {
@@ -200,6 +430,7 @@ impl Pollable for Socket {
         match self {
             Socket::Tcp(tcp) => tcp.poll(),
             Socket::Udp(udp) => udp.poll(),
+            Socket::Raw(raw) => raw.poll(),
             Socket::Unix(unix) => unix.poll(),
             #[cfg(feature = "vsock")]
             Socket::Vsock(vsock) => vsock.poll(),
@@ -210,6 +441,7 @@ impl Pollable for Socket {
         match self {
             Socket::Tcp(tcp) => tcp.register(context, events),
             Socket::Udp(udp) => udp.register(context, events),
+            Socket::Raw(raw) => raw.register(context, events),
             Socket::Unix(unix) => unix.register(context, events),
             #[cfg(feature = "vsock")]
             Socket::Vsock(vsock) => vsock.register(context, events),

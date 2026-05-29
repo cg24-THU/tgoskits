@@ -10,9 +10,10 @@ export NET := y
 export VSOCK := n
 export MEM := 1G
 export ICOUNT := n
+export DISK_IMG := rootfs-$(ARCH).img
 
 # Generated Options
-export A := $(PWD)
+export A := $(CURDIR)/starryos
 export NO_AXSTD := y
 export AX_LIB := ax-feat
 export APP_FEATURES := qemu
@@ -32,17 +33,17 @@ rootfs:
 		curl -f -L $(ROOTFS_URL)/$(ROOTFS_IMG).xz -O; \
 		xz -d $(ROOTFS_IMG).xz; \
 	fi
-	@cp $(ROOTFS_IMG) make/disk.img
+	@ln -sf $(CURDIR)/$(ROOTFS_IMG) $(CURDIR)/../arceos/rootfs-$(ARCH).img
 
 img:
 	@echo -e "\033[33mWARN: The 'img' target is deprecated. Please use 'rootfs' instead.\033[0m"
 	@$(MAKE) --no-print-directory rootfs
 
 defconfig justrun clean:
-	@$(MAKE) -C make $@
+	@$(MAKE) -C $(CURDIR)/../arceos $@
 
-build run debug disasm: defconfig
-	@$(MAKE) -C make $@
+build run debug disasm: rootfs defconfig
+	@$(MAKE) -C $(CURDIR)/../arceos $@
 
 ci-test:
 	./scripts/ci-test.py $(ARCH)
@@ -55,6 +56,9 @@ la:
 	$(MAKE) ARCH=loongarch64 run
 
 vf2:
-	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
+	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=ax-plat-riscv64-visionfive2 BUS=mmio build
+
+sg2002:
+	$(MAKE) ARCH=riscv64 APP_FEATURES=sg2002 MYPLAT=ax-plat-riscv64-sg2002 BUS=mmio SMP=1 UIMAGE=y LOG=info build
 
 .PHONY: build run justrun debug disasm clean

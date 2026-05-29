@@ -5,11 +5,11 @@ pub(crate) mod stream;
 
 use core::task::Context;
 
-pub use ax_driver::prelude::{VsockAddr, VsockConnId};
 use ax_errno::{AxError, AxResult};
 use ax_io::{IoBuf, IoBufMut, Read, Write};
 use axpoll::{IoEvents, Pollable};
 use enum_dispatch::enum_dispatch;
+pub use rdif_vsock::{VsockAddr, VsockConnId};
 
 pub use self::stream::VsockStreamTransport;
 use crate::{
@@ -99,14 +99,14 @@ impl SocketOps for VsockSocket {
         self.transport.connect(remote_addr)
     }
 
-    fn listen(&self) -> AxResult {
+    fn listen(&self, _backlog: usize) -> AxResult {
         self.transport.listen()
     }
 
     fn accept(&self) -> AxResult<Socket> {
         self.transport.accept().map(|(transport, _addr)| {
             let socket = VsockSocket::new(transport);
-            Socket::Vsock(socket)
+            socket.into()
         })
     }
 

@@ -3,10 +3,8 @@
 use core::arch::asm;
 
 #[cfg(target_arch = "aarch64")]
-lazy_static::lazy_static! {
-    #[allow(dead_code)]
-    pub static ref HARDWARE_SUPPORT_CRC32: bool = has_hardware_crc32();
-}
+#[allow(dead_code)]
+pub static HARDWARE_SUPPORT_CRC32: spin::LazyLock<bool> = spin::LazyLock::new(has_hardware_crc32);
 
 // In `core::arch::aarch64`, the intrinsics with the `c` suffix implement the
 // Castagnoli polynomial used by CRC32C.
@@ -62,7 +60,7 @@ pub unsafe fn crc32c_hardware(mut crc: u32, data: &[u8]) -> u32 {
         let mut len = data.len();
 
         // 1. Consume the unaligned prefix so the hot loop can use 64-bit loads.
-        while len > 0 && (p as usize) % 8 != 0 {
+        while len > 0 && !(p as usize).is_multiple_of(8) {
             crc = __crc32cb(crc, *p);
             p = p.add(1);
             len -= 1;

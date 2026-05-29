@@ -1,14 +1,14 @@
 use core::{future::poll_fn, task::Poll};
 
 use ax_errno::{AxError, AxResult, LinuxError};
-use ax_hal::uspace::UserContext;
+use ax_runtime::hal::cpu::uspace::UserContext;
 use ax_task::{
     current,
     future::{self, block_on},
 };
 use linux_raw_sys::general::{
-    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, kernel_sigaction, siginfo,
-    timespec,
+    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE, SS_FLAG_BITS,
+    SS_ONSTACK, kernel_sigaction, siginfo, timespec,
 };
 use starry_process::Pid;
 use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo};
@@ -16,14 +16,16 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, block_next_signal, check_signals, processes, send_signal_to_process,
-        send_signal_to_process_group, send_signal_to_thread,
+        AsThread, block_next_signal, check_signals, get_process_cred, processes,
+        send_signal_to_process, send_signal_to_thread,
     },
     time::TimeValueLike,
 };
 
 pub(crate) fn check_sigset_size(size: usize) -> AxResult<()> {
-    if size != size_of::<SignalSet>() && size != 0 {
+    // Align with Linux raw syscall semantics (for ABI param 'sigmask'): when sigsetsize is checked,
+    // it must exactly match the kernel SignalSet size (8 bytes).
+    if size != size_of::<SignalSet>() {
         return Err(AxError::InvalidInput);
     }
     Ok(())
@@ -79,17 +81,11 @@ pub fn sys_rt_sigaction(
         return Err(AxError::InvalidInput);
     }
 
-    let curr = current();
-    let mut actions = curr.as_thread().proc_data.signal.actions.lock();
-    if let Some(oldact) = oldact.nullable() {
-        oldact.vm_write(actions[signo].clone().into())?;
-    }
-    if let Some(act) = act.nullable() {
-        let act = unsafe { act.vm_read_uninit()?.assume_init() }.into();
-        debug!("sys_rt_sigaction <= signo: {signo:?}, act: {act:?}");
-        actions[signo] = act;
-    }
-    Ok(0)
+    current()
+        .as_thread()
+        .proc_data
+        .signal
+        .set_action(signo, act, oldact)
 }
 
 pub fn sys_rt_sigpending(set: *mut SignalSet, sigsetsize: usize) -> AxResult<isize> {
@@ -98,16 +94,69 @@ pub fn sys_rt_sigpending(set: *mut SignalSet, sigsetsize: usize) -> AxResult<isi
     Ok(0)
 }
 
-fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
+pub(crate) fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
     if signo == 0 {
         return Ok(None);
     }
     let signo = parse_signo(signo)?;
+    let curr = current();
+    let thread = curr.as_thread();
     Ok(Some(SignalInfo::new_user(
         signo,
         code,
-        current().as_thread().proc_data.proc.pid(),
+        thread.proc_data.proc.pid(),
+        thread.cred().uid,
     )))
+}
+
+/// Check whether the current process has permission to send a signal to
+/// `target_pid`.
+///
+/// Permission rules:
+/// - Root (euid==0, approximating CAP_KILL) can signal anyone
+/// - Same process is always allowed
+/// - Otherwise: sender's {euid, uid} must match target's {uid, euid, suid}
+///
+/// TODO: SIGCONT is allowed to any process in the same session (job control).
+/// Implementing this requires passing the signal number into this function
+/// and checking session membership.
+pub(crate) fn check_kill_permission(target_pid: Pid) -> AxResult<()> {
+    let sender = current().as_thread().cred();
+    if sender.euid == 0 {
+        return Ok(());
+    }
+    let self_pid = current().as_thread().proc_data.proc.pid();
+    if target_pid == self_pid {
+        return Ok(());
+    }
+    let target_cred = get_process_cred(target_pid)?;
+    // Linux checks: {sender.euid, sender.uid} × {target.uid, target.euid, target.suid}
+    if sender.euid == target_cred.uid
+        || sender.euid == target_cred.euid
+        || sender.euid == target_cred.suid
+        || sender.uid == target_cred.uid
+        || sender.uid == target_cred.euid
+        || sender.uid == target_cred.suid
+    {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
+
+/// Send a signal to each member of a process group, checking
+/// per-member permission. EPERM for individual members is swallowed
+/// (matches Linux behavior).
+fn kill_process_group_checked(pgid: Pid, sig: Option<SignalInfo>) -> AxResult<()> {
+    let pg = crate::task::get_process_group(pgid)?;
+    if let Some(sig) = sig {
+        for proc in pg.processes() {
+            if check_kill_permission(proc.pid()).is_ok() {
+                let _ = send_signal_to_process(proc.pid(), Some(sig.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
@@ -116,42 +165,61 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
 
     match pid {
         1.. => {
-            send_signal_to_process(pid as _, sig)?;
+            check_kill_permission(pid as _)?;
+            if let Some(sig) = sig {
+                let curr = current();
+                let thread = curr.as_thread();
+                let signo = sig.signo();
+                if pid as Pid == thread.proc_data.proc.pid() && !thread.signal.signal_blocked(signo)
+                {
+                    // A process-directed signal may be delivered to any
+                    // unblocked thread. Prefer the current thread for
+                    // self-signals so `kill(getpid(), SIGSTOP)` cannot return
+                    // to userspace and race into the next syscall before this
+                    // thread observes the stop.
+                    send_signal_to_thread(None, curr.id().as_u64() as Pid, Some(sig))?;
+                } else {
+                    send_signal_to_process(pid as _, Some(sig))?;
+                }
+            } else {
+                send_signal_to_process(pid as _, None)?;
+            }
         }
         0 => {
             let pgid = current().as_thread().proc_data.proc.group().pgid();
-            send_signal_to_process_group(pgid, sig)?;
+            kill_process_group_checked(pgid, sig)?;
         }
         -1 => {
+            // Broadcast: send to all processes the caller may signal,
+            // except init and self. EPERM is silently swallowed per Linux.
             let curr_pid = current().as_thread().proc_data.proc.pid();
             if let Some(sig) = sig {
                 for proc_data in processes() {
-                    // POSIX.1 requires that kill(-1,sig) send sig to all processes that
-                    //    the calling process may send signals to, except possibly for some
-                    //    implementation-defined system processes.  Linux allows a process
-                    //    to signal itself, but on Linux the call kill(-1,sig) does not
-                    //    signal the calling process.
                     if proc_data.proc.is_init() || proc_data.proc.pid() == curr_pid {
                         continue;
                     }
-                    let _ = send_signal_to_process(proc_data.proc.pid(), Some(sig.clone()));
+                    if check_kill_permission(proc_data.proc.pid()).is_ok() {
+                        let _ = send_signal_to_process(proc_data.proc.pid(), Some(sig.clone()));
+                    }
                 }
             }
         }
         ..-1 => {
-            send_signal_to_process_group((-pid) as Pid, sig)?;
+            kill_process_group_checked((-pid) as Pid, sig)?;
         }
     }
     Ok(0)
 }
 
 pub fn sys_tkill(tid: Pid, signo: u32) -> AxResult<isize> {
+    check_kill_permission(tid)?;
     let sig = make_siginfo(signo, SI_TKILL)?;
     send_signal_to_thread(None, tid, sig)?;
     Ok(0)
 }
 
 pub fn sys_tgkill(tgid: Pid, tid: Pid, signo: u32) -> AxResult<isize> {
+    check_kill_permission(tgid)?;
     let sig = make_siginfo(signo, SI_TKILL)?;
     send_signal_to_thread(Some(tgid), tid, sig)?;
     Ok(0)
@@ -206,7 +274,7 @@ pub fn sys_rt_tgsigqueueinfo(
 
 pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
     block_next_signal();
-    current().as_thread().signal.restore(uctx);
+    current().as_thread().signal.restore(uctx)?;
     Ok(uctx.retval() as isize)
 }
 
@@ -235,14 +303,18 @@ pub fn sys_rt_sigtimedwait(
     let signal = &thr.signal;
 
     let old_blocked = signal.blocked();
-    signal.set_blocked(old_blocked & !set);
+    // Publish sigwait_set so that send_signal skips is_ignore() for signals
+    // this thread is waiting for.  We do NOT unblock the waited signals:
+    // dequeue_signal(&set) can already retrieve blocked pending signals, and
+    // keeping them blocked prevents check_signals from racing to dequeue and
+    // discard them as default-ignore (e.g. SIGCHLD/SIGURG).
+    *signal.sigwait_set.lock() = Some(set);
 
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
     let fut = poll_fn(|cx| {
         if let Some(sig) = signal.dequeue_signal(&set) {
-            signal.set_blocked(old_blocked);
             Poll::Ready(Some(sig))
-        } else if check_signals(thr, uctx, Some(old_blocked)) {
+        } else if check_signals(thr, uctx, Some(old_blocked), None) {
             Poll::Ready(None)
         } else {
             let _ = curr.poll_interrupt(cx);
@@ -252,13 +324,16 @@ pub fn sys_rt_sigtimedwait(
 
     let Ok(sig) = block_on(future::timeout(timeout, fut)) else {
         // Timeout
-        signal.set_blocked(old_blocked);
+        *signal.sigwait_set.lock() = None;
         return Err(AxError::WouldBlock);
     };
     let Some(sig) = sig else {
         // Interrupted
+        *signal.sigwait_set.lock() = None;
         return Ok(0);
     };
+
+    *signal.sigwait_set.lock() = None;
 
     if let Some(info) = info.nullable() {
         info.vm_write(sig.0)?;
@@ -285,7 +360,7 @@ pub fn sys_rt_sigsuspend(
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
 
     block_on(poll_fn(|cx| {
-        if check_signals(thr, uctx, Some(old_blocked)) {
+        if check_signals(thr, uctx, Some(old_blocked), None) {
             return Poll::Ready(());
         }
         let _ = curr.poll_interrupt(cx);
@@ -306,7 +381,13 @@ pub fn sys_sigaltstack(ss: *const SignalStack, old_ss: *mut SignalStack) -> AxRe
 
     if let Some(ss) = ss.nullable() {
         let ss = unsafe { ss.vm_read_uninit()?.assume_init() };
-        if ss.size <= MINSIGSTKSZ as usize {
+        if sig.stack_active() {
+            return Err(AxError::OperationNotPermitted);
+        }
+        if ss.flags & !(SS_DISABLE | SS_ONSTACK | SS_FLAG_BITS) != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        if ss.flags & SS_DISABLE == 0 && ss.size < MINSIGSTKSZ as usize {
             return Err(AxError::NoMemory);
         }
         sig.set_stack(ss);

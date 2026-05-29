@@ -5,14 +5,16 @@ use core::{ffi::CStr, iter};
 
 use ax_errno::{AxError, AxResult};
 use ax_fs::{CachedFile, FS_CONTEXT, FileBackend};
-use ax_hal::{
+use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+use ax_runtime::hal::{
     mem::virt_to_phys,
     paging::{MappingFlags, PageSize},
 };
-use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ax_sync::Mutex;
 use axfs_ng_vfs::Location;
-use kernel_elf_parser::{AuxEntry, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region};
+use kernel_elf_parser::{
+    AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region,
+};
 use ouroboros::self_referencing;
 use uluru::LRUCache;
 
@@ -20,6 +22,14 @@ use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     mm::aspace::{AddrSpace, Backend},
 };
+
+#[cfg(target_arch = "riscv64")]
+const RISCV_COMPAT_HWCAP_IMAFDC: usize = (1 << (b'I' - b'A'))
+    | (1 << (b'M' - b'A'))
+    | (1 << (b'A' - b'A'))
+    | (1 << (b'F' - b'A'))
+    | (1 << (b'D' - b'A'))
+    | (1 << (b'C' - b'A'));
 
 /// Creates a new empty user address space.
 pub fn new_user_aspace_empty() -> AxResult<AddrSpace> {
@@ -63,7 +73,7 @@ fn mapping_flags(flags: xmas_elf::program::Flags) -> MappingFlags {
         mapping_flags |= MappingFlags::READ;
     }
     if flags.is_write() {
-        mapping_flags |= MappingFlags::WRITE;
+        mapping_flags |= MappingFlags::WRITE | MappingFlags::READ;
     }
     if flags.is_execute() {
         mapping_flags |= MappingFlags::EXECUTE;
@@ -115,6 +125,7 @@ fn map_elf<'a>(
             FileBackend::Cached(cache.clone()),
             ph.offset,
             Some(ph.offset + ph.file_size),
+            false,
         );
         uspace.map(
             seg_start.align_down_4k(),
@@ -166,6 +177,48 @@ impl ElfCacheEntry {
             Ok(e) => Ok(Ok(e)),
             Err((_, heads)) => Ok(Err(heads.data)),
         }
+    }
+}
+
+/// The value reported in the `AT_HWCAP` auxiliary vector entry.
+///
+/// `AT_HWCAP` (auxv type 16) advertises architecture-dependent CPU capability
+/// bits to userspace. `getauxval(AT_HWCAP)` reads it, and feature-dispatching
+/// runtimes gate optional instruction sets on it.
+///
+/// Per-arch policy:
+/// - **loongarch64**: report the baseline the kernel actually provides. The
+///   platform enables LSX (128-bit vectors) at boot via `enable_lsx()`
+///   (`EUEN.SXE`), so we set `CPUCFG | LAM | UAL | FPU | LSX`. This is required:
+///   numpy on Alpine loongarch is built with an LSX baseline and refuses to
+///   import unless `HWCAP_LOONGARCH_LSX` (bit 4) is set. LASX (256-bit, bit 5)
+///   is intentionally *not* set because the kernel does not enable `EUEN.ASXE`;
+///   claiming it could trap when userspace executes 256-bit ops.
+/// - **riscv64**: report the baseline ISA bits expected by Linux-compatible
+///   user space (`IMAFDC`).
+/// - **x86_64 / aarch64**: 0. x86 uses CPUID; aarch64 ASIMD/NEON is mandatory.
+const fn hwcap_value() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        // Linux loongarch HWCAP bits (uapi/asm/hwcap.h):
+        const HWCAP_LOONGARCH_CPUCFG: usize = 1 << 0;
+        const HWCAP_LOONGARCH_LAM: usize = 1 << 1;
+        const HWCAP_LOONGARCH_UAL: usize = 1 << 2;
+        const HWCAP_LOONGARCH_FPU: usize = 1 << 3;
+        const HWCAP_LOONGARCH_LSX: usize = 1 << 4;
+        HWCAP_LOONGARCH_CPUCFG
+            | HWCAP_LOONGARCH_LAM
+            | HWCAP_LOONGARCH_UAL
+            | HWCAP_LOONGARCH_FPU
+            | HWCAP_LOONGARCH_LSX
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        RISCV_COMPAT_HWCAP_IMAFDC
+    }
+    #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+    {
+        0
     }
 }
 
@@ -233,17 +286,31 @@ impl ElfLoader {
         };
 
         let elf = map_elf(uspace, crate::config::USER_SPACE_BASE, elf)?;
-        let ldso = ldso
-            .map(|elf| map_elf(uspace, crate::config::USER_INTERP_BASE, elf))
-            .transpose()?;
+        let ldso = if ldso.is_some() {
+            let max_end = uspace
+                .areas()
+                .map(|area| area.end().as_usize())
+                .max()
+                .unwrap_or(crate::config::USER_SPACE_BASE);
+            let interp_base = (max_end + 0x100000 - 1) & !(0x100000 - 1);
+            ldso.map(|elf| map_elf(uspace, interp_base, elf))
+                .transpose()?
+        } else {
+            None
+        };
 
         let entry = VirtAddr::from_usize(
             ldso.as_ref()
                 .map_or_else(|| elf.entry(), |ldso| ldso.entry()),
         );
-        let auxv = elf
+        let mut auxv = elf
             .aux_vector(PAGE_SIZE_4K, ldso.map(|elf| elf.base()))
             .collect::<Vec<_>>();
+        // `aux_vector()` only emits PHDR/PHENT/PHNUM/PAGESZ/ENTRY (+BASE). Add
+        // AT_HWCAP so `getauxval(AT_HWCAP)` returns the CPU capability bits the
+        // kernel actually provides (notably LSX on loongarch64, which numpy
+        // requires to import). See `hwcap_value()` for the per-arch policy.
+        auxv.push(AuxEntry::new(AuxType::HWCAP, hwcap_value()));
 
         Ok(Ok((entry, auxv)))
     }
@@ -254,6 +321,7 @@ static ELF_LOADER: Mutex<ElfLoader> = Mutex::new(ElfLoader::new());
 /// Clear the ELF cache.
 ///
 /// Useful for removing noises during memory leak detect.
+#[cfg(feature = "memtrack")]
 pub fn clear_elf_cache() {
     ELF_LOADER.lock().0.clear();
 }
@@ -274,12 +342,14 @@ pub fn load_user_app(
     path: Option<&str>,
     args: &[String],
     envs: &[String],
-) -> AxResult<(VirtAddr, VirtAddr)> {
+) -> AxResult<(VirtAddr, VirtAddr, Vec<AuxEntry>)> {
     let path = path
         .or_else(|| args.first().map(String::as_str))
         .ok_or(AxError::InvalidInput)?;
 
-    // FIXME: impl `/proc/self/exe` to let busybox retry running
+    // `/proc/self/exe` is available in procfs; busybox can `readlink` it
+    // to re-exec itself as a shell on ENOEXEC, provided the busybox build
+    // includes that fallback (Alpine's prebuilt binary may not).
     if path.ends_with(".sh") {
         let new_args: Vec<String> = iter::once("/bin/sh".to_owned())
             .chain(args.iter().cloned())
@@ -318,7 +388,7 @@ pub fn load_user_app(
         ustack_size,
         MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
         false,
-        Backend::new_alloc(ustack_start, PageSize::Size4K),
+        Backend::new_alloc(ustack_start, PageSize::Size4K, "[stack]"),
     )?;
 
     let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());
@@ -338,8 +408,8 @@ pub fn load_user_app(
         heap_size,
         MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
         true,
-        Backend::new_alloc(heap_start, PageSize::Size4K),
+        Backend::new_alloc(heap_start, PageSize::Size4K, "[heap]"),
     )?;
 
-    Ok((entry, user_sp))
+    Ok((entry, user_sp, auxv))
 }

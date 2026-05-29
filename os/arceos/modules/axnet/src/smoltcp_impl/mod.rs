@@ -5,12 +5,12 @@ mod listen_table;
 mod tcp;
 mod udp;
 
-use alloc::vec;
+use alloc::{boxed::Box, vec};
 use core::{cell::RefCell, ops::DerefMut};
 
-use ax_driver::prelude::*;
 use ax_hal::time::{NANOS_PER_MICROS, wall_time_nanos};
 use ax_lazyinit::LazyInit;
+use ax_net_ng::{EthernetDriver, NetDeviceError, NetRxBuffer};
 use ax_sync::Mutex;
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
@@ -54,7 +54,8 @@ static ETH0: LazyInit<InterfaceWrapper> = LazyInit::new();
 struct SocketSetWrapper<'a>(Mutex<SocketSet<'a>>);
 
 struct DeviceWrapper {
-    inner: RefCell<AxNetDevice>, /* use `RefCell` is enough since it's wrapped in `Mutex` in `InterfaceWrapper`. */
+    inner: RefCell<Box<dyn EthernetDriver>>,
+    sockets_for_preprocess: Option<usize>,
 }
 
 struct InterfaceWrapper {
@@ -116,6 +117,14 @@ impl<'a> SocketSetWrapper<'a> {
         f(socket)
     }
 
+    pub fn with_socket_set_mut<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut SocketSet<'a>) -> R,
+    {
+        let mut set = self.0.lock();
+        f(&mut set)
+    }
+
     pub fn poll_interfaces(&self) {
         ETH0.poll(&self.0);
     }
@@ -127,7 +136,7 @@ impl<'a> SocketSetWrapper<'a> {
 }
 
 impl InterfaceWrapper {
-    fn new(name: &'static str, dev: AxNetDevice, ether_addr: EthernetAddress) -> Self {
+    fn new(name: &'static str, dev: Box<dyn EthernetDriver>, ether_addr: EthernetAddress) -> Self {
         let mut config = Config::new(HardwareAddress::Ethernet(ether_addr));
         config.random_seed = RANDOM_SEED;
 
@@ -173,15 +182,22 @@ impl InterfaceWrapper {
         let mut iface = self.iface.lock();
         let mut sockets = sockets.lock();
         let timestamp = Self::current_time();
+        dev.set_sockets_for_preprocess(Some(&mut *sockets as *mut SocketSet<'_> as usize));
         iface.poll(timestamp, dev.deref_mut(), &mut sockets);
+        dev.set_sockets_for_preprocess(None);
     }
 }
 
 impl DeviceWrapper {
-    fn new(inner: AxNetDevice) -> Self {
+    fn new(inner: Box<dyn EthernetDriver>) -> Self {
         Self {
             inner: RefCell::new(inner),
+            sockets_for_preprocess: None,
         }
+    }
+
+    fn set_sockets_for_preprocess(&mut self, sockets: Option<usize>) {
+        self.sockets_for_preprocess = sockets;
     }
 }
 
@@ -202,19 +218,19 @@ impl Device for DeviceWrapper {
             return None;
         }
 
-        if !dev.can_transmit() {
-            return None;
-        }
         let rx_buf = match dev.receive() {
             Ok(buf) => buf,
             Err(err) => {
-                if !matches!(err, DevError::Again) {
+                if !matches!(err, NetDeviceError::Again) {
                     warn!("receive failed: {err:?}");
                 }
                 return None;
             }
         };
-        Some((AxNetRxToken(&self.inner, rx_buf), AxNetTxToken(&self.inner)))
+        Some((
+            AxNetRxToken(&self.inner, rx_buf, self.sockets_for_preprocess),
+            AxNetTxToken(&self.inner),
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -223,11 +239,7 @@ impl Device for DeviceWrapper {
             warn!("recycle_tx_buffers failed: {e:?}");
             return None;
         }
-        if dev.can_transmit() {
-            Some(AxNetTxToken(&self.inner))
-        } else {
-            None
-        }
+        Some(AxNetTxToken(&self.inner))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -239,26 +251,34 @@ impl Device for DeviceWrapper {
     }
 }
 
-struct AxNetRxToken<'a>(&'a RefCell<AxNetDevice>, NetBufPtr);
-struct AxNetTxToken<'a>(&'a RefCell<AxNetDevice>);
+struct AxNetRxToken<'a>(
+    &'a RefCell<Box<dyn EthernetDriver>>,
+    Box<dyn NetRxBuffer>,
+    Option<usize>,
+);
+struct AxNetTxToken<'a>(&'a RefCell<Box<dyn EthernetDriver>>);
 
 impl RxToken for AxNetRxToken<'_> {
-    fn preprocess(&self, sockets: &mut SocketSet<'_>) {
-        snoop_tcp_packet(self.1.packet(), sockets).ok();
-    }
-
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let rx_buf = self.1;
+        let mut rx_buf = self.1;
         trace!(
             "RECV {} bytes: {:02X?}",
             rx_buf.packet_len(),
             rx_buf.packet()
         );
+        if let Some(sockets) = self.2 {
+            // SAFETY: InterfaceWrapper::poll installs this pointer only for the
+            // duration of iface.poll(), and RxToken::consume is called
+            // synchronously before the packet is handed to smoltcp sockets.
+            unsafe {
+                snoop_tcp_packet(rx_buf.packet(), &mut *(sockets as *mut SocketSet<'_>)).ok();
+            }
+        }
         let result = f(rx_buf.packet());
-        self.0.borrow_mut().recycle_rx_buffer(rx_buf).unwrap();
+        self.0.borrow_mut().recycle_rx_buffer(&mut *rx_buf).unwrap();
         result
     }
 }
@@ -272,7 +292,7 @@ impl TxToken for AxNetTxToken<'_> {
         let mut tx_buf = dev.alloc_tx_buffer(len).unwrap();
         let ret = f(tx_buf.packet_mut());
         trace!("SEND {} bytes: {:02X?}", len, tx_buf.packet());
-        dev.transmit(tx_buf).unwrap();
+        dev.transmit(&mut *tx_buf).unwrap();
         ret
     }
 }
@@ -314,8 +334,8 @@ pub fn bench_receive() {
     ETH0.dev.lock().bench_receive_bandwidth();
 }
 
-pub(crate) fn init(net_dev: AxNetDevice) {
-    let ether_addr = EthernetAddress(net_dev.mac_address().0);
+pub(crate) fn init(net_dev: Box<dyn EthernetDriver>) {
+    let ether_addr = EthernetAddress(net_dev.mac_address());
     let eth0 = InterfaceWrapper::new("eth0", net_dev, ether_addr);
 
     let ip = IP.parse().expect("invalid IP address");

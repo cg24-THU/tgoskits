@@ -25,16 +25,16 @@ pub type DefaultByteAllocator = buddy_slab_allocator::SlabAllocator<PAGE_SIZE>;
 const PAGE_SIZE: usize = 0x1000;
 
 #[ax_percpu::def_percpu]
-static PRECPU_SLAB: PrecpuSlab<PAGE_SIZE> = PrecpuSlab::new_uninit();
+static PERCPU_SLAB: PercpuSlab<PAGE_SIZE> = PercpuSlab::new_uninit();
 
 static SLAB_POOL: SlabPool = SlabPool;
 
-struct PrecpuSlab<const PAGE_SIZE: usize = 0x1000> {
+struct PercpuSlab<const PAGE_SIZE: usize = 0x1000> {
     cpu_id: Option<u16>,
     inner: SpinNoIrq<SlabAllocator<PAGE_SIZE>>,
 }
 
-impl<const PAGE_SIZE: usize> PrecpuSlab<PAGE_SIZE> {
+impl<const PAGE_SIZE: usize> PercpuSlab<PAGE_SIZE> {
     const fn new_uninit() -> Self {
         Self {
             cpu_id: None,
@@ -58,7 +58,7 @@ impl<const PAGE_SIZE: usize> PrecpuSlab<PAGE_SIZE> {
     }
 }
 
-impl<const PAGE_SIZE: usize> SlabTrait for PrecpuSlab<PAGE_SIZE> {
+impl<const PAGE_SIZE: usize> SlabTrait for PercpuSlab<PAGE_SIZE> {
     fn cpu_id(&self) -> usize {
         self.cpu_id_checked() as usize
     }
@@ -82,27 +82,27 @@ impl<const PAGE_SIZE: usize> SlabTrait for PrecpuSlab<PAGE_SIZE> {
     }
 }
 
-fn current_precpu_slab() -> &'static PrecpuSlab<PAGE_SIZE> {
+fn current_percpu_slab() -> &'static PercpuSlab<PAGE_SIZE> {
     // Safety: the outer allocator lock disables local IRQs/preemption before
     // upstream buddy-slab-allocator calls this hook.
-    unsafe { PRECPU_SLAB.current_ref_raw() }
+    unsafe { PERCPU_SLAB.current_ref_raw() }
 }
 
-fn remote_precpu_slab(cpu_idx: usize) -> &'static PrecpuSlab<PAGE_SIZE> {
+fn remote_percpu_slab(cpu_idx: usize) -> &'static PercpuSlab<PAGE_SIZE> {
     // Safety: the owner CPU id comes from slab metadata and references a valid
     // per-CPU slab that was initialized during CPU bring-up.
-    unsafe { PRECPU_SLAB.remote_ref_raw(cpu_idx) }
+    unsafe { PERCPU_SLAB.remote_ref_raw(cpu_idx) }
 }
 
 struct SlabPool;
 
 impl SlabPoolTrait for SlabPool {
     fn current_slab(&self) -> &dyn SlabTrait {
-        current_precpu_slab()
+        current_percpu_slab()
     }
 
     fn owner_slab(&self, cpu_idx: usize) -> &dyn SlabTrait {
-        remote_precpu_slab(cpu_idx)
+        remote_percpu_slab(cpu_idx)
     }
 }
 
@@ -113,7 +113,7 @@ fn slab_pool() -> &'static dyn SlabPoolTrait {
 
 #[virt_to_phys_impl]
 fn virt_to_phys(vaddr: usize) -> usize {
-    crate::eii::virt_to_phys(vaddr)
+    ax_plat::mem::virt_to_phys(vaddr.into()).as_usize()
 }
 
 /// The global allocator used by ArceOS when `buddy-slab` is enabled.
@@ -165,11 +165,10 @@ impl GlobalAllocator {
     /// Allocate arbitrary number of bytes. Returns the left bound of the
     /// allocated region.
     pub fn alloc(&self, layout: Layout) -> AllocResult<NonNull<u8>> {
-        let result = self
-            .inner
-            .lock()
-            .alloc(layout)
-            .map_err(crate::AllocError::from);
+        let result = {
+            let inner = self.inner.lock();
+            inner.alloc(layout).map_err(crate::AllocError::from)
+        };
         if result.is_ok() {
             self.usages.lock().alloc(UsageKind::RustHeap, layout.size());
         }
@@ -178,10 +177,13 @@ impl GlobalAllocator {
 
     /// Gives back the allocated region to the byte allocator.
     pub fn dealloc(&self, pos: NonNull<u8>, layout: Layout) {
+        {
+            let inner = self.inner.lock();
+            unsafe { inner.dealloc(pos, layout) };
+        }
         self.usages
             .lock()
             .dealloc(UsageKind::RustHeap, layout.size());
-        unsafe { self.inner.lock().dealloc(pos, layout) };
     }
 
     /// Allocates contiguous pages.
@@ -191,11 +193,12 @@ impl GlobalAllocator {
         alignment: usize,
         kind: UsageKind,
     ) -> AllocResult<usize> {
-        let result = self
-            .inner
-            .lock()
-            .alloc_pages(num_pages, alignment)
-            .map_err(crate::AllocError::from);
+        let result = {
+            let inner = self.inner.lock();
+            inner
+                .alloc_pages(num_pages, alignment)
+                .map_err(crate::AllocError::from)
+        };
         if result.is_ok() {
             self.usages.lock().alloc(kind, num_pages * PAGE_SIZE);
         }
@@ -209,11 +212,12 @@ impl GlobalAllocator {
         alignment: usize,
         kind: UsageKind,
     ) -> AllocResult<usize> {
-        let result = self
-            .inner
-            .lock()
-            .alloc_pages_lowmem(num_pages, alignment)
-            .map_err(crate::AllocError::from);
+        let result = {
+            let inner = self.inner.lock();
+            inner
+                .alloc_pages_lowmem(num_pages, alignment)
+                .map_err(crate::AllocError::from)
+        };
         if result.is_ok() {
             self.usages.lock().alloc(kind, num_pages * PAGE_SIZE);
         }
@@ -233,8 +237,11 @@ impl GlobalAllocator {
 
     /// Gives back the allocated pages starts from `pos` to the page allocator.
     pub fn dealloc_pages(&self, pos: usize, num_pages: usize, kind: UsageKind) {
+        {
+            let inner = self.inner.lock();
+            inner.dealloc_pages(pos, num_pages);
+        }
         self.usages.lock().dealloc(kind, num_pages * PAGE_SIZE);
-        self.inner.lock().dealloc_pages(pos, num_pages);
     }
 
     /// Returns the number of allocated bytes in the allocator backend.
@@ -346,8 +353,11 @@ pub fn global_allocator() -> &'static GlobalAllocator {
 }
 
 /// Initializes the per-CPU slab for the current CPU.
-pub fn init_precpu_slab(cpu_id: usize) {
-    PRECPU_SLAB.with_current(|slab| slab.init(cpu_id));
+///
+/// Must run after per-CPU storage is initialized and before scheduler, IPI, or
+/// IRQ paths can allocate on this CPU.
+pub fn init_percpu_slab(cpu_id: usize) {
+    PERCPU_SLAB.with_current(|slab| slab.init(cpu_id));
 }
 
 /// Initializes the global allocator with the given memory region.

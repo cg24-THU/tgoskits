@@ -2,17 +2,20 @@ use core::ffi::c_char;
 
 use ax_errno::{AxError, AxResult};
 use ax_task::current;
-use linux_raw_sys::general::{__user_cap_data_struct, __user_cap_header_struct};
+use linux_raw_sys::general::{__user_cap_data_struct, __user_cap_header_struct, CAP_LAST_CAP};
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use crate::{
     mm::vm_load_string,
-    task::{AsThread, get_process_data},
+    task::{AsThread, Cred, get_process_data, get_task},
 };
 
 const CAPABILITY_VERSION_3: u32 = 0x20080522;
+const PERSONALITY_GET: u32 = 0xffff_ffff;
+const PR_THP_DISABLE_EXCEPT_ADVISED: usize = 1 << 1;
 
-fn validate_cap_header(header_ptr: *mut __user_cap_header_struct) -> AxResult<()> {
+/// Validate the cap header and return the target pid (0 means self).
+fn validate_cap_header(header_ptr: *mut __user_cap_header_struct) -> AxResult<u32> {
     // FIXME: AnyBitPattern
     let mut header = unsafe { header_ptr.vm_read_uninit()?.assume_init() };
     if header.version != CAPABILITY_VERSION_3 {
@@ -20,21 +23,49 @@ fn validate_cap_header(header_ptr: *mut __user_cap_header_struct) -> AxResult<()
         header_ptr.vm_write(header)?;
         return Err(AxError::InvalidInput);
     }
-    let _ = get_process_data(header.pid as u32)?;
-    Ok(())
+    let pid = header.pid as u32;
+    let _ = get_process_data(pid)?;
+    Ok(pid)
+}
+
+/// Read the credential set for the thread identified by TID (0 = self).
+///
+/// capget(2) operates on the thread identified by `header.pid`; on Linux
+/// threads in the same thread group share the same `struct cred` by default,
+/// so reading any thread's cred gives the same answer.
+fn cred_for_pid(pid: u32) -> AxResult<alloc::sync::Arc<Cred>> {
+    if pid == 0 {
+        return Ok(current().as_thread().cred());
+    }
+    let task = get_task(pid).map_err(|_| AxError::NoSuchProcess)?;
+    task.try_as_thread()
+        .map(|t| t.cred())
+        .ok_or(AxError::NoSuchProcess)
 }
 
 pub fn sys_capget(
     header: *mut __user_cap_header_struct,
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
-    validate_cap_header(header)?;
+    let pid = validate_cap_header(header)?;
 
-    data.vm_write(__user_cap_data_struct {
-        effective: u32::MAX,
-        permitted: u32::MAX,
-        inheritable: u32::MAX,
-    })?;
+    if data.is_null() {
+        return Ok(0);
+    }
+
+    let cred = cred_for_pid(pid)?;
+    let caps = if cred.euid == 0 { u32::MAX } else { 0 };
+    let data_struct = __user_cap_data_struct {
+        effective: caps,
+        permitted: caps,
+        inheritable: caps,
+    };
+    // Capability version 3 uses an array of TWO __user_cap_data_struct
+    // entries (low 32 bits and high 32 bits). Write both.
+    unsafe {
+        data.vm_write(data_struct)?;
+        data.add(1).vm_write(data_struct)?;
+    }
     Ok(0)
 }
 
@@ -42,27 +73,30 @@ pub fn sys_capset(
     header: *mut __user_cap_header_struct,
     _data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
-    validate_cap_header(header)?;
+    let _ = validate_cap_header(header)?;
 
+    let cred = current().as_thread().cred();
+    if cred.euid != 0 {
+        return Err(AxError::OperationNotPermitted);
+    }
+    // For now, accept and ignore the values (no real capability tracking).
     Ok(0)
 }
 
 pub fn sys_umask(mask: u32) -> AxResult<isize> {
     let curr = current();
-    let old = curr.as_thread().proc_data.replace_umask(mask);
+    let old = curr.as_thread().proc_data.replace_umask(mask & 0o777);
     Ok(old as isize)
 }
 
-pub fn sys_setreuid(_ruid: u32, _euid: u32) -> AxResult<isize> {
-    Ok(0)
-}
-
-pub fn sys_setresuid(_ruid: u32, _euid: u32, _suid: u32) -> AxResult<isize> {
-    Ok(0)
-}
-
-pub fn sys_setresgid(_rgid: u32, _egid: u32, _sgid: u32) -> AxResult<isize> {
-    Ok(0)
+pub fn sys_personality(persona: usize) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let old = proc_data.personality();
+    if persona as u32 != PERSONALITY_GET {
+        proc_data.replace_personality(persona);
+    }
+    Ok(old as isize)
 }
 
 pub fn sys_get_mempolicy(
@@ -107,10 +141,89 @@ pub fn sys_prctl(
             buf[..len].copy_from_slice(&name.as_bytes()[..len]);
             vm_write_slice(arg2 as _, &buf)?;
         }
+        PR_SET_PDEATHSIG => {
+            let sig = arg2 as u32;
+            if sig > 64 {
+                return Err(AxError::InvalidInput);
+            }
+            current().as_thread().set_pdeathsig(sig);
+        }
+        PR_GET_PDEATHSIG => {
+            let sig = current().as_thread().pdeathsig() as i32;
+            (arg2 as *mut i32).vm_write(sig)?;
+        }
+        PR_CAPBSET_READ => {
+            if arg2 > CAP_LAST_CAP as usize {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(1);
+        }
+        PR_GET_DUMPABLE => {
+            // man 2 prctl PR_GET_DUMPABLE: returns current dumpable value
+            // (0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER, 2=SUID_DUMP_ROOT).
+            return Ok(current().as_thread().proc_data.dumpable() as isize);
+        }
+        PR_SET_DUMPABLE => {
+            // man 2 prctl PR_SET_DUMPABLE: arg2 must be SUID_DUMP_DISABLE (0)
+            // or SUID_DUMP_USER (1); attempt to set SUID_DUMP_ROOT (2) returns
+            // EINVAL (only kernel internally sets 2 on suid/sgid binary exec).
+            //
+            // Validate on the raw `usize` to reject high-bit-set values like
+            // `0x1_0000_0001UL` that would otherwise truncate to 1 and falsely
+            // succeed. Linux rejects such inputs with EINVAL.
+            if arg2 != 0 && arg2 != 1 {
+                return Err(AxError::InvalidInput);
+            }
+            current().as_thread().proc_data.set_dumpable(arg2 as i32);
+        }
         PR_SET_SECCOMP => {}
         PR_MCE_KILL => {}
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            current().as_thread().set_no_new_privs();
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            return Ok(current().as_thread().no_new_privs() as isize);
+        }
+        PR_SET_THP_DISABLE => {
+            // Linux reserves arg4/arg5 for this option; non-zero values are invalid.
+            if arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            // StarryOS does not implement transparent huge pages, but userspace
+            // may use this prctl as a compatibility hint and query it later.
+            // Linux returns 0, 1, or 3 from PR_GET_THP_DISABLE:
+            //   0: enabled, 1: disabled, 3: disabled except advised mappings.
+            let thp_disable = match (arg2, arg3) {
+                (0, 0) => 0,
+                (0, _) => return Err(AxError::InvalidInput),
+                (_, 0) => 1,
+                (_, PR_THP_DISABLE_EXCEPT_ADVISED) => 1 | PR_THP_DISABLE_EXCEPT_ADVISED,
+                _ => return Err(AxError::InvalidInput),
+            };
+            current()
+                .as_thread()
+                .proc_data
+                .set_thp_disable(thp_disable as u32);
+        }
+        PR_GET_THP_DISABLE => {
+            // PR_GET_THP_DISABLE takes no additional arguments and returns the
+            // process-local state recorded by PR_SET_THP_DISABLE.
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(current().as_thread().proc_data.thp_disable() as isize);
+        }
         PR_SET_MM => {
             // not implemented; but avoid annoying warnings
+            return Err(AxError::InvalidInput);
+        }
+        PR_SET_VMA => {
+            if arg2 == PR_SET_VMA_ANON_NAME as usize {
+                return Ok(0);
+            }
             return Err(AxError::InvalidInput);
         }
         _ => {

@@ -1,12 +1,24 @@
-use alloc::{format, sync::Arc};
-use core::{any::Any, task::Context, time::Duration};
-
-#[allow(unused_imports)]
-use ax_driver::prelude::{
-    AxInputDevice, BaseDriverOps, DevError, Event, EventType, InputDeviceId, InputDriverOps,
+use alloc::{collections::VecDeque, format, sync::Arc};
+use core::{
+    any::Any,
+    sync::atomic::{AtomicU32, Ordering},
+    task::Context,
+    time::Duration,
 };
+
+/// Number of registered `/dev/input/event*` nodes. Populated by
+/// [`input_devices`] at boot and read by sysfs so
+/// `/sys/class/input/event<N>` matches reality.
+static EVENT_DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Returns the number of `/dev/input/event*` devices currently exposed.
+pub fn input_device_count() -> u32 {
+    EVENT_DEVICE_COUNT.load(Ordering::Acquire)
+}
+
 use ax_errno::{AxError, AxResult};
-use ax_hal::time::wall_time;
+use ax_input::{ErasedInputDevice, Event, EventType, InputDevice, InputDeviceId, InputError};
+use ax_runtime::hal::time::wall_time;
 use ax_sync::Mutex;
 use axfs_ng_vfs::{DeviceId, NodeFlags, NodeType, VfsResult};
 use axpoll::{IoEvents, Pollable};
@@ -23,14 +35,27 @@ use crate::{
 };
 const KEY_CNT: usize = EventType::Key.bits_count();
 
+/// Bound on the in-kernel evdev buffer. Linux uses a per-client ring of
+/// 64 entries by default; we hold a bit more headroom so a 20-key burst
+/// (key down + key up + EV_SYN per key = 60 entries) never drops events
+/// before userspace drains it. When the queue is full we follow Linux's
+/// behavior and drop the oldest entry rather than blocking the driver.
+const READ_AHEAD_CAP: usize = 256;
+
 struct Inner {
-    device: AxInputDevice,
-    read_ahead: Option<(Duration, Event)>,
+    device: ErasedInputDevice,
+    read_ahead: VecDeque<(Duration, Event)>,
     key_state: Bitmap<KEY_CNT>,
 }
 impl Inner {
-    fn has_event(&mut self) -> bool {
-        if self.read_ahead.is_none() {
+    /// Drain everything the driver currently has buffered into `read_ahead`,
+    /// updating cached key state along the way. Stops at the first
+    /// `InputError::Again` (driver queue empty) or after a hard ceiling of
+    /// `READ_AHEAD_CAP` pulls per call to bound a single pass.
+    ///
+    /// Returns `true` if at least one event is now queued for userspace.
+    fn drain_into_queue(&mut self) -> bool {
+        for _ in 0..READ_AHEAD_CAP {
             match self.device.read_event() {
                 Ok(event) => {
                     if event.event_type == EventType::Key as u16 {
@@ -40,25 +65,80 @@ impl Inner {
                             self.key_state.set(event.code as usize, true);
                         }
                     }
-                    self.read_ahead = Some((wall_time(), event));
+                    if self.read_ahead.len() >= READ_AHEAD_CAP {
+                        // Mirror Linux evdev: drop oldest on overflow so
+                        // the most recent input wins. Keeps the driver
+                        // ring from stalling under a burst we cannot
+                        // forward to a slow reader.
+                        self.read_ahead.pop_front();
+                    }
+                    self.read_ahead.push_back((wall_time(), event));
                 }
-                Err(DevError::Again) => {}
+                Err(InputError::Again) => break,
                 Err(err) => {
                     warn!("Failed to read event: {err:?}");
+                    break;
                 }
             }
         }
-        self.read_ahead.is_some()
+        !self.read_ahead.is_empty()
+    }
+
+    fn has_event(&mut self) -> bool {
+        self.drain_into_queue()
     }
 }
 
+/// Linux `INPUT_PROP_CNT` — the property bitmap is 4 bytes (32 properties).
+const INPUT_PROP_CNT: usize = 0x20;
+/// Linux `INPUT_PROP_POINTER` — emulates a relative pointer or maps absolute
+/// coordinates to screen space. libinput hides the cursor on absolute-axis
+/// devices that do not advertise this until proximity is reported.
+const INPUT_PROP_POINTER: usize = 0x00;
+/// Linux `INPUT_PROP_DIRECT` — direct-mapped axes (touchscreens).
+const INPUT_PROP_DIRECT: usize = 0x01;
+
+/// Linux uapi `struct input_absinfo` — six `i32`s returned by
+/// `EVIOCGABS(axis)`.
+#[repr(C)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+struct InputAbsInfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+/// Maximum number of absolute axes Linux's EVIOCGABS encodes (0..0x3F).
+const ABS_MAX: usize = 0x40;
+
 pub struct EventDev {
     inner: Mutex<Inner>,
+    /// IRQ line the underlying driver delivers buffered events on, when
+    /// the driver advertises one. `Pollable::register` wires the caller's
+    /// waker to this IRQ so virtio-input wakes its consumer in
+    /// microseconds rather than waiting for the next safety-net tick.
+    irq: Option<usize>,
     ev_bits: Bitmap<{ EventType::COUNT as usize }>,
+    /// Cached `EVIOCGPROP` bitmap. Computed once at probe from the driver's
+    /// raw bits with a synthesized `INPUT_PROP_POINTER` for absolute or
+    /// relative pointing devices that aren't touchscreens. QEMU's
+    /// virtio-mouse / virtio-tablet do not set the bit themselves, so
+    /// libinput would otherwise classify the tablet as a graphics tablet
+    /// and suppress the cursor pending a never-firing `BTN_TOOL_PEN`.
+    prop_bits: [u8; INPUT_PROP_CNT.div_ceil(8)],
+    /// Cached `EV_ABS` bitmap. Used by `EVIOCGABS` to refuse axes the
+    /// device doesn't advertise with `EINVAL`, matching Linux's
+    /// `evdev_handle_get_val` behavior. virtio-drivers reports the
+    /// underlying `Error::IoError` when the AbsInfo selector has size 0,
+    /// which would otherwise surface as EIO and confuse libinput.
+    abs_bits: [u8; ABS_MAX.div_ceil(8)],
 }
 
 impl EventDev {
-    pub fn new(mut device: AxInputDevice) -> Self {
+    pub fn new(mut device: ErasedInputDevice) -> Self {
         let mut ev_bits = Bitmap::new();
         for i in 0..EventType::COUNT {
             let Some(ty) = EventType::from_repr(i) else {
@@ -72,26 +152,46 @@ impl EventDev {
             }
         }
 
-        // let mut out = [0u8; 2000];
-        // if device.get_event_bits(EventType::Absolute, &mut out).unwrap() {
-        //     let mut bits = Vec::new();
-        //     for i in 0..EventType::Absolute.bits_count() {
-        //         if (out[i / 8] >> (i % 8)) & 1 != 0 {
-        //             bits.push(i);
-        //         }
-        //     }
-        //     warn!("{bits:?}");
-        // } else {
-        //     warn!("failure");
-        // }
+        let mut prop_bits = [0u8; INPUT_PROP_CNT.div_ceil(8)];
+        let prop_bits_reliable = match device.get_prop_bits(&mut prop_bits) {
+            Ok(_) => true,
+            Err(err) => {
+                warn!("Failed to get input property bits: {err:?}");
+                false
+            }
+        };
+        let is_touchscreen = prop_bits[INPUT_PROP_DIRECT / 8] & (1 << (INPUT_PROP_DIRECT % 8)) != 0;
+        let has_axes =
+            ev_bits.get(EventType::Relative as usize) || ev_bits.get(EventType::Absolute as usize);
+        if prop_bits_reliable && has_axes && !is_touchscreen {
+            prop_bits[INPUT_PROP_POINTER / 8] |= 1 << (INPUT_PROP_POINTER % 8);
+        }
+
+        let mut abs_bits = [0u8; ABS_MAX.div_ceil(8)];
+        if ev_bits.get(EventType::Absolute as usize) {
+            let _ = device.get_event_bits(EventType::Absolute, &mut abs_bits);
+        }
+
+        let irq = device.irq_num();
         Self {
             inner: Mutex::new(Inner {
                 device,
-                read_ahead: None,
+                read_ahead: VecDeque::with_capacity(READ_AHEAD_CAP),
                 key_state: Bitmap::new(),
             }),
+            irq,
             ev_bits,
+            prop_bits,
+            abs_bits,
         }
+    }
+
+    fn axis_supported(&self, axis: u8) -> bool {
+        let bit = axis as usize;
+        if bit >= ABS_MAX {
+            return false;
+        }
+        self.abs_bits[bit / 8] & (1 << (bit % 8)) != 0
     }
 
     fn get_event_bits(&self, arg: usize, size: usize, ty: u8) -> AxResult<usize> {
@@ -124,6 +224,19 @@ fn return_str(arg: usize, size: usize, s: &str) -> AxResult<usize> {
     let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
     Ok(copy_bytes(s.as_bytes(), slice))
 }
+
+fn input_error_to_ax_error(err: InputError) -> AxError {
+    match err {
+        InputError::AlreadyExists => AxError::AlreadyExists,
+        InputError::Again => AxError::WouldBlock,
+        InputError::BadState => AxError::BadState,
+        InputError::InvalidInput | InputError::Unsupported => AxError::InvalidInput,
+        InputError::Io => AxError::Io,
+        InputError::NoMemory => AxError::NoMemory,
+        InputError::ResourceBusy => AxError::ResourceBusy,
+    }
+}
+
 fn return_zero_bits(arg: usize, size: usize, bits: usize) -> AxResult<usize> {
     let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
     let len = bits.div_ceil(8).min(slice.len());
@@ -163,11 +276,11 @@ impl DeviceOps for EventDev {
         }
         let mut read = 0;
         let mut inner = self.inner.lock();
+        // Drain the driver queue once up front so a single read() syscall
+        // can return as many buffered events as the user buffer holds.
+        inner.drain_into_queue();
         for out in buf.chunks_exact_mut(size_of::<InputEvent>()) {
-            if !inner.has_event() {
-                break;
-            }
-            let Some((time, event)) = inner.read_ahead.take() else {
+            let Some((time, event)) = inner.read_ahead.pop_front() else {
                 break;
             };
             let input_event = InputEvent {
@@ -242,11 +355,7 @@ impl DeviceOps for EventDev {
                         match nr {
                             // EVIOCGNAME
                             0x06 => {
-                                return return_str(
-                                    arg,
-                                    size,
-                                    self.inner.lock().device.device_name(),
-                                );
+                                return return_str(arg, size, self.inner.lock().device.name());
                             }
                             // EVIOCGPHYS
                             0x07 => {
@@ -260,11 +369,14 @@ impl DeviceOps for EventDev {
                             0x08 => {
                                 return return_str(arg, size, self.inner.lock().device.unique_id());
                             }
-                            // EVIOCGPROP
+                            // EVIOCGPROP — device property bitmap. libinput
+                            // uses INPUT_PROP_POINTER to keep the cursor
+                            // visible on absolute-axis pointing devices like
+                            // virtio-tablet; we synthesize the bit at probe
+                            // for any non-touchscreen with REL/ABS axes.
                             0x09 => {
-                                // For some reasons virtio does not provide prop
-                                // bits for now
-                                return Ok(0);
+                                let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
+                                return Ok(copy_bytes(&self.prop_bits, slice));
                             }
                             // EVIOCGKEY
                             0x18 => {
@@ -293,8 +405,39 @@ impl DeviceOps for EventDev {
                         }
                         const ABS_CNT: u8 = 0x40;
                         if nr & !(ABS_CNT - 1) == ABS_CNT {
-                            // TODO: abs info
-                            return Ok(0);
+                            // EVIOCGABS(axis) — absolute axis info.
+                            // libinput needs min/max/res to map the
+                            // virtio-tablet's 0..0x7FFF absolute range to
+                            // screen pixels; without it motion is treated
+                            // as noise.
+                            if size < size_of::<InputAbsInfo>() {
+                                return Err(AxError::InvalidInput);
+                            }
+                            let axis = nr & (ABS_CNT - 1);
+                            // Linux's evdev returns EINVAL for any axis the
+                            // device does not advertise in its EV_ABS bitmap.
+                            // virtio-drivers surfaces the same as Error::IoError
+                            // (size==0 selector), so without this pre-check
+                            // userspace would see EIO and reject the device.
+                            if !self.axis_supported(axis) {
+                                return Err(AxError::InvalidInput);
+                            }
+                            let info = match self.inner.lock().device.get_abs_info(axis) {
+                                Ok(info) => info,
+                                Err(err) => return Err(input_error_to_ax_error(err)),
+                            };
+                            let abs = InputAbsInfo {
+                                value: 0,
+                                minimum: info.min,
+                                maximum: info.max,
+                                fuzz: info.fuzz,
+                                flat: info.flat,
+                                resolution: info.res,
+                            };
+                            let bytes = abs.as_bytes();
+                            let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
+                            slice[..bytes.len()].copy_from_slice(bytes);
+                            return Ok(bytes.len());
                         }
                         return Err(AxError::InvalidInput);
                     }
@@ -315,7 +458,24 @@ impl Pollable for EventDev {
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
+        if !events.contains(IoEvents::IN) {
+            return;
+        }
+        // If the driver advertises an IRQ, route the caller's waker
+        // through the per-IRQ waker list so the next virtio-input
+        // notification wakes the consumer directly. The unconditional
+        // wake the previous implementation issued here turned epoll
+        // (level-triggered) into a register → wake → consume-empty →
+        // re-register loop spinning at ~500 Hz; that hot loop is what
+        // libinput saw as continuous activity.
+        if let Some(irq) = self.irq {
+            ax_task::future::register_irq_waker(irq, context.waker());
+        }
+        // No IRQ advertised: fall back to an immediate wake so the
+        // caller doesn't sleep forever on devices that never deliver
+        // an IRQ at all (observed for QEMU virtio-keyboard-pci on
+        // aarch64 HVF). For these the consumer effectively polls.
+        else if self.inner.lock().has_event() {
             context.waker().wake_by_ref();
         }
     }
@@ -323,27 +483,43 @@ impl Pollable for EventDev {
 
 pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
     let mut inputs = DirMapping::new();
-    let mut input_id = 0;
+    let mut mice_alias: Option<Arc<EventDev>> = None;
+    let mut input_id: u32 = 0;
     let input_devices = ax_input::take_inputs();
-    let mut keys = [0; 0x300usize.div_ceil(8)];
-    for (i, mut device) in input_devices.into_iter().enumerate() {
+    for mut device in input_devices.into_iter() {
+        let mut keys = [0; 0x300usize.div_ceil(8)];
         assert!(device.get_event_bits(EventType::Key, &mut keys).unwrap());
 
+        const BTN_MOUSE: usize = 0x110;
+        let is_mouse = keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0;
+
+        let event_dev = Arc::new(EventDev::new(device));
         let dev = Device::new(
             fs.clone(),
             NodeType::CharacterDevice,
-            DeviceId::new(13, (i + 1) as _),
-            Arc::new(EventDev::new(device)),
+            DeviceId::new(13, 64 + input_id),
+            event_dev.clone(),
         );
+        inputs.add(format!("event{input_id}"), dev);
+        input_id += 1;
 
-        const BTN_MOUSE: usize = 0x110;
-        if keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0 {
-            // Mouse
-            inputs.add("mice", dev);
-        } else {
-            inputs.add(format!("event{input_id}"), dev);
-            input_id += 1;
+        if is_mouse && mice_alias.is_none() {
+            mice_alias = Some(event_dev);
         }
     }
+
+    if let Some(event_dev) = mice_alias {
+        inputs.add(
+            "mice",
+            Device::new(
+                fs,
+                NodeType::CharacterDevice,
+                DeviceId::new(13, 63),
+                event_dev,
+            ),
+        );
+    }
+
+    EVENT_DEVICE_COUNT.store(input_id, Ordering::Release);
     inputs
 }

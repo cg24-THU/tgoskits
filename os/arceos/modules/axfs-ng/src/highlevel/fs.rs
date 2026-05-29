@@ -2,14 +2,15 @@ use alloc::{
     borrow::{Cow, ToOwned},
     collections::vec_deque::VecDeque,
     string::String,
-    sync::Arc,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 
 use ax_io::{Read, Write};
+use ax_kspin::SpinNoIrq;
 use ax_sync::Mutex;
 use axfs_ng_vfs::{
-    Location, Metadata, NodePermission, NodeType, VfsError, VfsResult,
+    Location, Metadata, Mountpoint, NodePermission, NodeType, VfsError, VfsResult,
     path::{Component, Components, Path, PathBuf},
 };
 use spin::Once;
@@ -22,15 +23,55 @@ pub const SYMLINKS_MAX: usize = 40;
 /// Global root filesystem context, initialized once during [`init_filesystems`](crate::init_filesystems).
 pub static ROOT_FS_CONTEXT: Once<FsContext> = Once::new();
 
+/// Registry of all live `FsContext` instances (weak references).
+///
+/// Each time a task-local [`FS_CONTEXT`] is created, it registers its
+/// `Arc<Mutex<FsContext>>` here via [`register_fs_context`].  This allows
+/// [`FsContext::propagate_pivot_root`] to iterate over every task's
+/// filesystem context and apply the same root / cwd fixup that Linux
+/// performs in `chroot_fs_refs()` after `pivot_root(2)`.
+static FS_REGISTRY: SpinNoIrq<Vec<Weak<Mutex<FsContext>>>> = SpinNoIrq::new(Vec::new());
+
+/// Register an `FsContext` in the global [`FS_REGISTRY`].
+fn register_fs_context(ctx: &Arc<Mutex<FsContext>>) {
+    let mut registry = FS_REGISTRY.lock();
+    // Prune dead weak references so the registry does not grow unboundedly
+    // in long-running scenarios where pivot_root is never invoked.
+    registry.retain(|weak| weak.upgrade().is_some());
+    registry.push(Arc::downgrade(ctx));
+}
+
+/// Returns `true` if any live `FsContext` has its `root_dir` or `current_dir`
+/// inside the given `mountpoint`.
+pub fn is_mount_busy(mp: &Arc<Mountpoint>) -> bool {
+    let refs: Vec<Arc<Mutex<FsContext>>> = {
+        let mut registry = FS_REGISTRY.lock();
+        registry.retain(|weak| weak.upgrade().is_some());
+        registry.iter().filter_map(|weak| weak.upgrade()).collect()
+    };
+    for ctx_arc in refs {
+        let ctx = ctx_arc.lock();
+        if Arc::ptr_eq(ctx.root_dir().mountpoint(), mp)
+            || Arc::ptr_eq(ctx.current_dir().mountpoint(), mp)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 scope_local::scope_local! {
     /// Task-local filesystem context, defaulting to a clone of [`ROOT_FS_CONTEXT`].
-    pub static FS_CONTEXT: Arc<Mutex<FsContext>> =
-        Arc::new(Mutex::new(
+    pub static FS_CONTEXT: Arc<Mutex<FsContext>> = {
+        let ctx = Arc::new(Mutex::new(
             ROOT_FS_CONTEXT
                 .get()
                 .expect("Root FS context not initialized")
                 .clone(),
         ));
+        register_fs_context(&ctx);
+        ctx
+    };
 }
 
 /// A single entry returned by [`FsContext::read_dir`].
@@ -182,7 +223,7 @@ impl FsContext {
         if let Some(name) = name {
             Ok((dir, Cow::Borrowed(name)))
         } else if let Some(parent) = dir.parent() {
-            Ok((parent, Cow::Owned(dir.name().to_owned())))
+            Ok((parent, dir.name().into_owned().into()))
         } else {
             Err(VfsError::InvalidInput)
         }
@@ -249,16 +290,20 @@ impl FsContext {
         entry
             .parent()
             .ok_or(VfsError::IsADirectory)?
-            .unlink(entry.name(), false)
+            .unlink(&entry.name(), false)
     }
 
     /// Removes a directory from the filesystem.
     pub fn remove_dir(&self, path: impl AsRef<Path>) -> VfsResult<()> {
         let entry = self.resolve_no_follow(path.as_ref())?;
+        let dir = entry.entry().as_dir()?;
+        if dir.has_children()? {
+            return Err(VfsError::DirectoryNotEmpty);
+        }
         entry
             .parent()
             .ok_or(VfsError::ResourceBusy)?
-            .unlink(entry.name(), true)
+            .unlink(&entry.name(), true)
     }
 
     /// Renames a file or directory to a new name, replacing the original file
@@ -271,7 +316,27 @@ impl FsContext {
 
     /// Creates a new, empty directory at the provided path.
     pub fn create_dir(&self, path: impl AsRef<Path>, mode: NodePermission) -> VfsResult<Location> {
-        let (dir, name) = self.resolve_nonexistent(path.as_ref())?;
+        let path = path.as_ref();
+        // Empty path should return NotFound, not InvalidInput
+        if path.as_str().is_empty() {
+            return Err(VfsError::NotFound);
+        }
+        let (dir, name) = match self.resolve_nonexistent(path) {
+            Ok(pair) => pair,
+            Err(VfsError::InvalidInput) => {
+                // Path has no filename component (e.g. "/" or ".").
+                // Resolve it: if it exists and is a directory, return
+                // AlreadyExists (matching Linux EEXIST behaviour for mkdir("/")).
+                return match self.resolve(path) {
+                    Ok(loc) if loc.node_type() == NodeType::Directory => {
+                        Err(VfsError::AlreadyExists)
+                    }
+                    Ok(_) => Err(VfsError::NotADirectory),
+                    Err(e) => Err(e),
+                };
+            }
+            Err(e) => return Err(e),
+        };
         dir.create(name, NodeType::Directory, mode)
     }
 
@@ -304,6 +369,84 @@ impl FsContext {
     /// Returns the canonical, absolute form of a path.
     pub fn canonicalize(&self, path: impl AsRef<Path>) -> VfsResult<PathBuf> {
         self.resolve(path.as_ref())?.absolute_path()
+    }
+
+    /// Pivot the root filesystem to `new_root`, moving the old root to
+    /// `put_old` (which must be a directory under `new_root`).
+    ///
+    /// This follows Linux `pivot_root(2)` semantics: after the call the old
+    /// root filesystem is accessible at `put_old`, and can be unmounted from
+    /// there.
+    ///
+    /// Note: this method only updates **this** `FsContext`.  The caller must
+    /// invoke [`FsContext::propagate_pivot_root`] afterwards to update every
+    /// other task whose root / cwd still points at the old root, mirroring
+    /// Linux's `chroot_fs_refs()`.
+    pub fn pivot_root(&mut self, new_root: Location, put_old: Location) -> VfsResult<()> {
+        let old_root = self.root_dir.clone();
+        let old_root_mp = self.root_dir.mountpoint().clone();
+        let new_root_mp = new_root.mountpoint().clone();
+        old_root_mp.pivot_mount(&new_root_mp, &put_old)?;
+        let new_root_loc = new_root_mp.root_location();
+        self.root_dir = new_root_loc.clone();
+        // Only replace cwd if it was pointing at the old root — mirrors
+        // Linux's chroot_fs_refs / replace_path semantics.
+        if old_root.ptr_eq(&self.current_dir) {
+            self.current_dir = new_root_loc;
+        }
+        Ok(())
+    }
+
+    /// After a successful [`pivot_root`](Self::pivot_root), propagate the
+    /// root / cwd change to **all** other tasks in the same mount namespace.
+    ///
+    /// This mirrors `chroot_fs_refs()` in Linux's `fs/namespace.c`:
+    /// after `pivot_root(2)` reorganises the mount tree the kernel walks
+    /// every thread's `fs_struct` and switches any `root` / `pwd` that
+    /// pointed at the old root over to the new root.
+    ///
+    /// * `old_root` – the `Location` of the old root **before** the pivot
+    ///   (obtained from `ctx.root_dir().clone()` before calling
+    ///   [`pivot_root`](Self::pivot_root)).
+    /// * `new_root` – the `Location` of the new root **after** the pivot
+    ///   (obtained from `ctx.root_dir()` after calling
+    ///   [`pivot_root`](Self::pivot_root)).
+    ///
+    /// # Linux semantics
+    ///
+    /// For each registered `FsContext`, [`Location::ptr_eq`] is used to
+    /// compare both mountpoint **and** dentry, mirroring the kernel's
+    /// `replace_path()` check `fs->root.mnt == old_root->mnt &&
+    /// fs->root.dentry == old_root->dentry`:
+    /// - If `root_dir` is exactly `old_root` → set to `new_root`.
+    /// - If `current_dir` is exactly `old_root` → set to `new_root`.
+    ///
+    /// This avoids incorrectly updating tasks that have chroot'd into a
+    /// subdirectory of the old root (same mountpoint, different dentry).
+    pub fn propagate_pivot_root(old_root: &Location, new_root: &Location) {
+        // 1. Collect strong references while holding the registry lock, then
+        //    release it so we never nest two Mutex guards.
+        let refs: Vec<Arc<Mutex<FsContext>>> = {
+            let mut registry = FS_REGISTRY.lock();
+            registry.retain(|weak| weak.upgrade().is_some());
+            registry.iter().filter_map(|weak| weak.upgrade()).collect()
+        };
+
+        // 2. Walk every live FsContext and apply the same logic as
+        //    Linux chroot_fs_refs().
+        for ctx_arc in refs {
+            let mut ctx = ctx_arc.lock();
+
+            let update_root = old_root.ptr_eq(&ctx.root_dir);
+            let update_cwd = old_root.ptr_eq(&ctx.current_dir);
+
+            if update_root {
+                ctx.root_dir = new_root.clone();
+            }
+            if update_cwd {
+                ctx.current_dir = new_root.clone();
+            }
+        }
     }
 }
 

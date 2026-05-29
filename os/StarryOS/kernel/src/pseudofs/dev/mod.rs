@@ -1,15 +1,43 @@
 //! Special devices
 
+mod card0;
+#[cfg(all(feature = "rknpu", not(any(windows, unix))))]
+mod card1;
+#[cfg(all(feature = "rknpu", not(any(windows, unix))))]
+mod dma_heap;
+mod drm;
 #[cfg(feature = "input")]
-mod event;
+pub mod event;
 mod fb;
 #[cfg(feature = "dev-log")]
 mod log;
 mod r#loop;
+#[cfg(feature = "ext4")]
+mod loop_block;
+#[cfg(feature = "ext4")]
+pub use r#loop::LoopDevice;
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+pub mod ion;
 #[cfg(feature = "memtrack")]
 mod memtrack;
-mod rtc;
+#[cfg(all(feature = "rknpu", not(any(windows, unix))))]
+mod rknpu_card;
+#[cfg(all(feature = "rknpu", not(any(windows, unix))))]
+mod rknpu_drm;
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+pub mod tpu;
 pub mod tty;
+
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+mod cvi_camera;
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+mod cvi_usb_camera;
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+mod pinmux;
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+pub(super) mod pwm;
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+mod tty_serial;
 
 use alloc::{format, sync::Arc};
 use core::any::Any;
@@ -17,6 +45,11 @@ use core::any::Any;
 use ax_errno::AxError;
 use ax_sync::Mutex;
 use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+use spin::Once;
+
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+pub static ION_DEVICE: Once<Arc<ion::IonDevice>> = Once::new();
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -189,15 +222,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Arc::new(Random::new()),
         ),
     );
-    root.add(
-        "rtc0",
-        Device::new(
-            fs.clone(),
-            NodeType::CharacterDevice,
-            rtc::RTC0_DEVICE_ID,
-            Arc::new(rtc::Rtc),
-        ),
-    );
     if ax_display::has_display() {
         root.add(
             "fb0",
@@ -245,7 +269,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     #[cfg(feature = "dev-log")]
     root.add(
         "log",
-        crate::pseudofs::SimpleFile::new(fs.clone(), NodeType::Socket, || Ok(b"")),
+        crate::pseudofs::SimpleFile::new(fs.clone(), NodeType::Socket, || Ok("")),
     );
 
     #[cfg(feature = "memtrack")]
@@ -274,10 +298,73 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "shm",
         SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())),
     );
+    {
+        let mut bus_dir = DirMapping::new();
+        bus_dir.add(
+            "usb",
+            SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())),
+        );
+        root.add("bus", SimpleDir::new_maker(fs.clone(), Arc::new(bus_dir)));
+    }
 
-    // Loop devices
+    // /dev/dri/card0 — simpledrm-class DRM character device. Advertised
+    // unconditionally so libdrm/libudev see the DRM node even before
+    // there's a display device behind it.
+    let dri_card0 = card0::Card0::new();
+    let mut dri_dir = DirMapping::new();
+    dri_dir.add(
+        "card0",
+        Device::new(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            DeviceId::new(226, 0),
+            dri_card0.clone(),
+        ),
+    );
+    dri_dir.add(
+        "renderD128",
+        Device::new(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            DeviceId::new(226, 128),
+            dri_card0,
+        ),
+    );
+
+    #[cfg(all(feature = "rknpu", not(any(windows, unix))))]
+    {
+        // DMA heap devices (rknpu only)
+        let mut dma_heap_dir = DirMapping::new();
+        dma_heap_dir.add(
+            "system",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                dma_heap::DMA_HEAP_SYSTEM_DEVICE_ID,
+                Arc::new(dma_heap::DmaHeapSystem::new()),
+            ),
+        );
+        root.add(
+            "dma_heap",
+            SimpleDir::new_maker(fs.clone(), Arc::new(dma_heap_dir)),
+        );
+
+        // RockChip-specific NPU companion card (DRM card1).
+        dri_dir.add(
+            "card1",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                card1::CARD1_SYSTEM_DEVICE_ID,
+                Arc::new(card1::Card1::new()),
+            ),
+        );
+    }
+    root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri_dir)));
+
+    // Loop devices (major 7, minor = device index)
     for i in 0..16 {
-        let dev_id = DeviceId::new(7, 0);
+        let dev_id = DeviceId::new(7, i);
         root.add(
             format!("loop{i}"),
             Device::new(
@@ -295,6 +382,75 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "input",
         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
     );
+
+    #[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+    {
+        root.add(
+            "cvi-tpu0",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(240, 0),
+                Arc::new(unsafe { tpu::TpuDevice::new() }),
+            ),
+        );
+        let ion_device = Arc::new(ion::IonDevice::new());
+        ION_DEVICE.call_once(|| ion_device.clone());
+        root.add(
+            "ion",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(10, 56),
+                ion_device,
+            ),
+        );
+        root.add(
+            "ttyS1",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(4, 65),
+                Arc::new(tty_serial::new_tty_s1(115200)),
+            ),
+        );
+        root.add(
+            "ttyS2",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(4, 66),
+                Arc::new(tty_serial::new_tty_s2(115200)),
+            ),
+        );
+        root.add(
+            "cvi-camera0",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(10, 201),
+                Arc::new(cvi_camera::CviCamera::new()),
+            ),
+        );
+        root.add(
+            "cvi-usb-camera0",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(10, 202),
+                Arc::new(cvi_usb_camera::CviCamera::new()),
+            ),
+        );
+        root.add(
+            "pinmux",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(1, 1),
+                Arc::new(pinmux::PinmuxDev),
+            ),
+        );
+    }
 
     SimpleDir::new_maker(fs, Arc::new(root))
 }

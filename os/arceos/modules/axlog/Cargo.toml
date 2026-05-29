@@ -1,6 +1,6 @@
 [package]
 name = "ax-log"
-version.workspace = true
+version = "0.5.12"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = ["Yuekai Jia <equation618@gmail.com>"]
@@ -12,11 +12,9 @@ std = ["dep:chrono"]
 default = []
 
 [dependencies]
+axpanic.workspace = true
 cfg-if.workspace = true
 chrono = { workspace = true, default-features = true, optional = true }
 ax-crate-interface.workspace = true
 ax-kspin.workspace = true
 log.workspace = true
-
-[dev-dependencies]
-ax-log = { path = ".", features = ["std"] }

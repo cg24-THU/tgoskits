@@ -1,0 +1,32 @@
+[package]
+
+authors = ["周睿 <zrufo747@outlook.com>"]
+categories = ["embedded", "no-std"]
+description = "A rockchip soc driver, contains cru, power manager, pinctrl."
+edition = "2024"
+autotests = false
+keywords = ["driver", "cru", "clock", "power"]
+license = "MIT"
+name = "rockchip-soc"
+repository = "https://github.com/drivercraft/rockchip-soc"
+version = "0.3.0"
+
+[dependencies]
+bitflags = "2"
+dma-api = { workspace = true }
+enum_dispatch = "0.3.13"
+fdt-edit = "0.2.3"
+log = "0.4"
+mbarrier = "0.1"
+thiserror = {version = "2", default-features = false}
+tock-registers = "0.10"
+
+[target.'cfg(not(any(windows, unix)))'.dev-dependencies]
+ax-kspin.workspace = true
+num-align = "0.1.0"
+spin = { workspace = true }
+
+# bare-test integration test is temporarily disabled.
+# [[test]]
+# harness = false
+# name = "test"

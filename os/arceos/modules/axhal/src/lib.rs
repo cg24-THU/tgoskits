@@ -37,27 +37,9 @@ extern crate log;
 #[macro_use]
 extern crate ax_memory_addr;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "myplat")] {
-        // link the custom platform crate in your application.
-    }
-    else if #[cfg(plat_dyn)] {
-        extern crate axplat_dyn;
-    }
-    else if #[cfg(all(target_os = "none", feature = "defplat"))] {
-        #[cfg(target_arch = "x86_64")]
-        extern crate ax_plat_x86_pc;
-        #[cfg(target_arch = "aarch64")]
-        extern crate ax_plat_aarch64_qemu_virt;
-        #[cfg(target_arch = "riscv64")]
-        extern crate ax_plat_riscv64_qemu_virt;
-        #[cfg(target_arch = "loongarch64")]
-        extern crate ax_plat_loongarch64_qemu_virt;
-    } else {
-        // Link the dummy platform implementation to pass cargo test.
-        mod dummy;
-    }
-}
+#[path = "platform.rs"]
+mod platform_select;
+pub use platform_select::selected as platform;
 
 pub mod dtb;
 pub mod mem;
@@ -76,8 +58,8 @@ pub mod paging;
 /// Console input and output.
 pub mod console {
     #[cfg(feature = "irq")]
-    pub use ax_plat::console::irq_num;
-    pub use ax_plat::console::{read_bytes, write_bytes};
+    pub use ax_plat::console::{ConsoleIrqEvent, handle_irq, irq_num, set_input_irq_enabled};
+    pub use ax_plat::console::{read_bytes, write_bytes, write_text_bytes};
 }
 
 /// CPU power management.
@@ -89,7 +71,12 @@ pub mod power {
 
 /// Trap handling.
 pub mod trap {
-    pub use ax_cpu::trap::{PageFaultFlags, irq_handler, page_fault_handler};
+    #[cfg(target_arch = "x86_64")]
+    pub use ax_cpu::trap::debug_handler;
+    pub use ax_cpu::trap::{
+        PageFaultFlags, breakpoint_handler, dispatch_irq, dispatch_page_fault, irq_handler,
+        page_fault_handler, set_irq_handler, set_page_fault_handler,
+    };
 }
 
 /// CPU register states for context switching.
@@ -102,6 +89,7 @@ pub mod context {
     pub use ax_cpu::{TaskContext, TrapFrame};
 }
 
+pub use ax_cpu as cpu;
 pub use ax_cpu::asm;
 #[cfg(feature = "uspace")]
 pub use ax_cpu::uspace;
@@ -128,11 +116,11 @@ pub fn init_early(cpu_id: usize, arg: usize) {
 pub fn cpu_num() -> usize {
     #[cfg(feature = "smp")]
     {
-        use spin::Lazy;
+        use spin::LazyLock;
 
         /// The number of CPUs in the system. Based on the number declared by the
         /// platform crate and limited by the configured maximum CPU number.
-        static CPU_NUM: Lazy<usize> = Lazy::new(|| {
+        static CPU_NUM: LazyLock<usize> = LazyLock::new(|| {
             let max_cpu_num = ax_config::plat::MAX_CPU_NUM;
             let plat_cpu_num = ax_plat::power::cpu_num();
             let cpu_num = plat_cpu_num.min(max_cpu_num);

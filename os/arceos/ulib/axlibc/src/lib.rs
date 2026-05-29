@@ -26,11 +26,12 @@
 //! [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
 
 #![cfg_attr(all(not(test), not(doc)), no_std)]
-#![feature(thread_local)]
+#![cfg_attr(feature = "tls", feature(thread_local))]
 #![allow(clippy::missing_safety_doc)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
+extern crate ax_driver as _;
 
 mod ctypes {
     #[rustfmt::skip]

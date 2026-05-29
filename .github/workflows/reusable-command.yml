@@ -1,0 +1,155 @@
+name: Reusable Command
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: JSON-encoded runner labels for runs-on.
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+      use_container:
+        description: Whether to execute the command inside the CI container.
+        required: false
+        type: boolean
+        default: false
+      command:
+        description: Shell command to execute.
+        required: true
+        type: string
+      cache_key:
+        description: Shared cache key for rust-cache. Leave empty to disable cache.
+        required: false
+        type: string
+        default: ""
+      container_image:
+        description: Container image used for the job when use_container is true.
+        required: false
+        type: string
+        default: ""
+      apk_region:
+        description: APK mirror region passed through to Starry prebuild flows.
+        required: false
+        type: string
+        default: china
+      limit_to_owner:
+        description: Only run for this repository owner. Leave empty to run everywhere.
+        required: false
+        type: string
+        default: ""
+      main_pr_only:
+        description: Only run for pull requests targeting the main branch.
+        required: false
+        type: boolean
+        default: false
+      fetch_depth:
+        description: Checkout fetch depth. Use 0 when the command needs full git history.
+        required: false
+        type: string
+        default: "1"
+      timeout_minutes:
+        description: Maximum minutes to allow the command job to run.
+        required: false
+        type: number
+        default: 360
+jobs:
+  run_host:
+    if: >-
+      ${{
+        !inputs.use_container
+        && (inputs.limit_to_owner == '' || github.repository_owner == inputs.limit_to_owner)
+        && (!inputs.main_pr_only || (github.event_name == 'pull_request' && github.base_ref == 'main'))
+      }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{ inputs.fetch_depth }}
+
+      - name: Restore Rust cache
+        if: inputs.cache_key != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ inputs.cache_key }}
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Show Rust version
+        run: rustc --version
+
+      - name: Run command
+        env:
+          STARRY_APK_REGION: ${{ inputs.apk_region }}
+        run: ${{ inputs.command }}
+
+  run_container:
+    if: >-
+      ${{
+        inputs.use_container
+        && (inputs.limit_to_owner == '' || github.repository_owner == inputs.limit_to_owner)
+        && (!inputs.main_pr_only || (github.event_name == 'pull_request' && github.base_ref == 'main'))
+      }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    container:
+      image: ${{ inputs.container_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{ inputs.fetch_depth }}
+
+      - name: Show checkout state
+        shell: bash
+        run: |
+          set -eux
+          command -v git
+          git -c safe.directory="${GITHUB_WORKSPACE}" rev-parse --show-toplevel
+          git -c safe.directory="${GITHUB_WORKSPACE}" rev-parse --is-inside-work-tree
+
+      - name: Ensure qemu user emulators
+        shell: bash
+        run: |
+          set -eux
+          for emulator in \
+            qemu-aarch64-static \
+            qemu-riscv64-static \
+            qemu-loongarch64-static \
+            qemu-x86_64-static
+          do
+            if ! command -v "${emulator}" >/dev/null 2>&1; then
+              echo "::error::${emulator} not found; rebuild the CI container image to include qemu-user-static"
+              exit 1
+            fi
+          done
+
+      - name: Ensure musl cross toolchains
+        shell: bash
+        run: |
+          set -eux
+          for arch in aarch64 riscv64 x86_64 loongarch64; do
+            compiler="${arch}-linux-musl-cc"
+            if ! command -v "${compiler}" >/dev/null 2>&1; then
+              echo "::error::${compiler} not found; rebuild the CI container image to include musl cross toolchains"
+              exit 1
+            fi
+          done
+
+      - name: Restore Rust cache
+        if: inputs.cache_key != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ inputs.cache_key }}
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Show Rust version
+        run: rustc --version
+
+      - name: Run command
+        env:
+          STARRY_APK_REGION: ${{ inputs.apk_region }}
+        run: ${{ inputs.command }}

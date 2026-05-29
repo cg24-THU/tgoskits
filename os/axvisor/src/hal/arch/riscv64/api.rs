@@ -1,8 +1,6 @@
-struct VmInterruptIfImpl;
+#[cfg(not(feature = "dyn-plat"))]
+compile_error!("riscv64 Axvisor requires the dyn-plat feature");
 
-#[ax_crate_interface::impl_interface]
-impl ax_plat_riscv64_qemu_virt::irq::InjectIrqIf for VmInterruptIfImpl {
-    fn inject_virtual_interrupt(irq: usize) {
-        crate::hal::arch::inject_interrupt(irq);
-    }
+pub(super) fn init_platform_irq_injector() {
+    axplat_dyn::register_virtual_irq_injector(crate::hal::arch::inject_interrupt);
 }

@@ -11,9 +11,58 @@ use ax_errno::{AxError, AxResult, LinuxError};
 #[cfg(feature = "vsock")]
 use axnet::vsock::VsockAddr;
 use axnet::{SocketAddrEx, unix::UnixSocketAddr};
-use linux_raw_sys::net::*;
+use linux_raw_sys::{net::*, netlink::sockaddr_nl};
 
 use crate::mm::{UserConstPtr, UserPtr};
+
+pub fn normalize_socket_addr_ex_for_ip_stack(
+    addr: SocketAddrEx,
+    is_bind: bool,
+) -> AxResult<SocketAddrEx> {
+    match addr {
+        SocketAddrEx::Ip(SocketAddr::V4(_)) => Ok(addr),
+        SocketAddrEx::Ip(SocketAddr::V6(v6)) => {
+            let ip = *v6.ip();
+            let v4 = if let Some(v4) = ip.to_ipv4_mapped() {
+                v4
+            } else if ip.is_unspecified() {
+                if !is_bind {
+                    return Err(AxError::from(LinuxError::EINVAL));
+                }
+                Ipv4Addr::UNSPECIFIED
+            } else if ip == Ipv6Addr::LOCALHOST {
+                Ipv4Addr::LOCALHOST
+            } else if is_bind {
+                return Err(AxError::from(LinuxError::EADDRNOTAVAIL));
+            } else {
+                return Err(AxError::from(LinuxError::ENETUNREACH));
+            };
+            Ok(SocketAddrEx::Ip(SocketAddr::V4(SocketAddrV4::new(
+                v4,
+                v6.port(),
+            ))))
+        }
+        SocketAddrEx::Unix(_) => Ok(addr),
+        #[cfg(feature = "vsock")]
+        SocketAddrEx::Vsock(_) => Ok(addr),
+    }
+}
+
+pub fn socket_addr_ex_for_user_name(domain: u32, addr: SocketAddrEx) -> SocketAddrEx {
+    if domain != AF_INET6 {
+        return addr;
+    }
+    match addr {
+        SocketAddrEx::Ip(SocketAddr::V4(v4)) => {
+            SocketAddrEx::Ip(SocketAddr::V6(socket_addr_v4_to_mapped_v6(&v4)))
+        }
+        _ => addr,
+    }
+}
+
+pub fn socket_addr_v4_to_mapped_v6(v4: &SocketAddrV4) -> SocketAddrV6 {
+    SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0)
+}
 
 /// Trait to extend [`SocketAddr`] and its variants with methods for reading
 /// from and writing to user space.
@@ -50,6 +99,28 @@ fn fill_addr(addr: UserPtr<sockaddr>, addrlen: &mut socklen_t, data: &[u8]) -> A
     Ok(())
 }
 
+pub fn read_netlink_addr(
+    addr: UserConstPtr<sockaddr>,
+    addrlen: socklen_t,
+) -> AxResult<sockaddr_nl> {
+    if addrlen != size_of::<sockaddr_nl>() as socklen_t {
+        return Err(AxError::InvalidInput);
+    }
+    let addr_nl = addr.cast::<sockaddr_nl>().get_as_ref()?;
+    if addr_nl.nl_family as u32 != AF_NETLINK {
+        return Err(AxError::from(LinuxError::EAFNOSUPPORT));
+    }
+    Ok(*addr_nl)
+}
+
+pub fn write_netlink_addr(
+    addr_nl: &sockaddr_nl,
+    addr: UserPtr<sockaddr>,
+    addrlen: &mut socklen_t,
+) -> AxResult<()> {
+    fill_addr(addr, addrlen, unsafe { cast_to_slice(addr_nl) })
+}
+
 impl SocketAddrExt for SocketAddr {
     fn read_from_user(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<Self> {
         match read_family(addr, addrlen)? as u32 {
@@ -76,7 +147,7 @@ impl SocketAddrExt for SocketAddr {
 
 impl SocketAddrExt for SocketAddrV4 {
     fn read_from_user(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<Self> {
-        if addrlen != size_of::<sockaddr_in>() as socklen_t {
+        if addrlen < size_of::<sockaddr_in>() as socklen_t {
             return Err(AxError::InvalidInput);
         }
         let addr_in = addr.cast::<sockaddr_in>().get_as_ref()?;
@@ -109,7 +180,7 @@ impl SocketAddrExt for SocketAddrV4 {
 
 impl SocketAddrExt for SocketAddrV6 {
     fn read_from_user(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<Self> {
-        if addrlen != size_of::<sockaddr_in6>() as socklen_t {
+        if addrlen < size_of::<sockaddr_in6>() as socklen_t {
             return Err(AxError::InvalidInput);
         }
         let addr_in6 = addr.cast::<sockaddr_in6>().get_as_ref()?;
@@ -263,6 +334,11 @@ impl SocketAddrExt for SocketAddrEx {
     }
 
     fn family(&self) -> u16 {
-        AF_INET as u16
+        match self {
+            SocketAddrEx::Ip(ip) => ip.family(),
+            SocketAddrEx::Unix(unix) => unix.family(),
+            #[cfg(feature = "vsock")]
+            SocketAddrEx::Vsock(vsock) => vsock.family(),
+        }
     }
 }

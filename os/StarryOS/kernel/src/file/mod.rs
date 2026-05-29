@@ -1,32 +1,46 @@
 pub mod epoll;
 pub mod event;
 mod fs;
+pub mod inotify;
+#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+pub mod ion;
+pub mod memfd;
 mod net;
+pub mod netlink;
+mod packet;
 mod pidfd;
 mod pipe;
 pub mod signalfd;
+pub mod timerfd;
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::{ffi::c_int, time::Duration};
 
 use ax_errno::{AxError, AxResult};
-use ax_fs::{FS_CONTEXT, OpenOptions};
+use ax_fs::{FS_CONTEXT, FileBackend, FileFlags, OpenOptions};
 use ax_io::prelude::*;
 use ax_task::current;
 use axfs_ng_vfs::DeviceId;
 use axpoll::Pollable;
 use downcast_rs::{DowncastSync, impl_downcast};
 use flatten_objects::FlattenObjects;
-use linux_raw_sys::general::{RLIMIT_NOFILE, stat, statx, statx_timestamp};
+use linux_raw_sys::general::{
+    O_ACCMODE, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, RLIMIT_NOFILE, STATX_BASIC_STATS, stat, statx,
+    statx_timestamp,
+};
 use spin::RwLock;
 
 pub use self::{
     fs::{Directory, File, resolve_at, with_fs},
     net::Socket,
+    packet::{PacketSocket, SockAddrLl},
     pidfd::PidFd,
     pipe::Pipe,
 };
-use crate::task::{AX_FILE_LIMIT, AsThread};
+use crate::{
+    pseudofs::DeviceMmap,
+    task::{AX_FILE_LIMIT, AsThread},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Kstat {
@@ -95,8 +109,11 @@ impl From<Kstat> for statx {
     fn from(value: Kstat) -> Self {
         // SAFETY: valid for statx
         let mut statx: statx = unsafe { core::mem::zeroed() };
+        // We always populate the basic stats; Linux returns the same mask.
+        // `stx_attributes` is left zero — it reports FS-specific flags we do
+        // not track.
+        statx.stx_mask = STATX_BASIC_STATS;
         statx.stx_blksize = value.blksize as _;
-        statx.stx_attributes = value.mode as _;
         statx.stx_nlink = value.nlink as _;
         statx.stx_uid = value.uid as _;
         statx.stx_gid = value.gid as _;
@@ -149,8 +166,24 @@ pub trait FileLike: Pollable + DowncastSync {
 
     fn path(&self) -> Cow<'_, str>;
 
+    fn file_mmap(&self) -> AxResult<(FileBackend, FileFlags)> {
+        // man 2 mmap ENODEV: "The underlying filesystem of the specified file
+        // does not support memory mapping." This is the right errno for fd
+        // kinds that do not back onto a mappable file (directory, pipe,
+        // socket, epoll, eventfd, etc.).
+        Err(AxError::NoSuchDevice)
+    }
+
+    fn device_mmap(&self, _offset: u64) -> AxResult<DeviceMmap> {
+        Err(AxError::BadFileDescriptor)
+    }
+
     fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(AxError::NotATty)
+    }
+
+    fn open_flags(&self) -> u32 {
+        0
     }
 
     fn nonblocking(&self) -> bool {
@@ -158,6 +191,45 @@ pub trait FileLike: Pollable + DowncastSync {
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+        Ok(())
+    }
+
+    fn async_mode(&self) -> bool {
+        false
+    }
+
+    fn supports_async_mode(&self) -> bool {
+        false
+    }
+
+    fn set_async_mode(&self, _async_mode: bool) -> AxResult {
+        Err(AxError::NotATty)
+    }
+
+    fn owner(&self) -> AxResult<i32> {
+        Err(AxError::NotATty)
+    }
+
+    fn set_owner(&self, _owner: i32) -> AxResult {
+        Err(AxError::NotATty)
+    }
+
+    /// (device, inode) identity used as the key for advisory file locks
+    /// (fcntl POSIX/OFD locks and flock(2)).
+    ///
+    /// Returns `None` for fd kinds that have no inode and are therefore
+    /// not lockable (pipes, sockets, epoll, eventfd, ...). Regular files
+    /// and directories override this — Linux allows both kinds to carry
+    /// advisory locks.
+    fn inode_key(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    fn append(&self) -> bool {
+        false
+    }
+
+    fn set_append(&self, _append: bool) -> AxResult {
         Ok(())
     }
 
@@ -199,6 +271,18 @@ pub fn get_file_like(fd: c_int) -> AxResult<Arc<dyn FileLike>> {
         .ok_or(AxError::BadFileDescriptor)
 }
 
+/// Returns true iff `fd` was opened with `O_PATH`.
+///
+/// Used by syscalls that man explicitly forbids on PATH file descriptors
+/// (fchmod / fchown / fsetxattr / ioctl / mmap / fallocate / ...). Per
+/// man 2 open §"O_PATH": "other file operations ... fail with the error
+/// EBADF."
+pub fn fd_is_path(fd: c_int) -> bool {
+    get_file_like(fd)
+        .map(|f| f.open_flags() & O_PATH != 0)
+        .unwrap_or(false)
+}
+
 /// Add a file to the file descriptor table.
 pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
     let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current;
@@ -212,25 +296,131 @@ pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
 
 /// Close a file by `fd`.
 pub fn close_file_like(fd: c_int) -> AxResult {
-    let f = FD_TABLE
-        .write()
-        .remove(fd as usize)
-        .ok_or(AxError::BadFileDescriptor)?;
-    debug!("close_file_like <= count: {}", Arc::strong_count(&f.inner));
+    let removed = FD_TABLE.write().remove(fd as usize);
+    if let Some(f) = removed {
+        debug!("close_file_like <= count: {}", Arc::strong_count(&f.inner));
+        release_locks_on_close(f);
+        return Ok(());
+    }
+    #[cfg(feature = "ebpf")]
+    {
+        if crate::perf_event::perf_event_close(fd as u32).is_ok() {
+            return Ok(());
+        }
+        crate::ebpf::bpf_close_fd(fd as u32)?;
+    }
     Ok(())
+}
+
+fn notify_close_write(fd: &FileDescriptor) {
+    let access = fd.inner.open_flags() & O_ACCMODE;
+    if (access == O_WRONLY || access == O_RDWR) && fd.inner.is::<File>() {
+        let path = fd.inner.path();
+        inotify::notify_close_write_path(path.as_ref());
+    }
+}
+
+/// Close-time advisory-lock cleanup (the kernel side of POSIX
+/// "close-eats-locks", plus OFD release-on-last-close):
+///
+///   1. Drop every POSIX record lock the calling pid owns on the inode
+///      (Linux `locks_remove_posix()` driven by `filp_close()`).
+///   2. Drop the `FileDescriptor` so the `Arc<dyn FileLike>` ref
+///      count goes down — if this was the last reference, any OFD locks
+///      held against the now-dead OFD are released (their entries are
+///      pruned the next time something walks the table).
+///   3. Wake `F_SETLKW`/`F_OFD_SETLKW` waiters parked on this inode so
+///      they can re-check whether the freed range now lets them through.
+///
+/// `fd` is taken by value so the `Arc` actually drops before step 3 — a
+/// pre-drop wake would leave the waiter to re-check, see the OFD's
+/// `Weak` still alive, and sleep forever.
+pub fn release_locks_on_close(fd: FileDescriptor) {
+    let key = fd.inner.inode_key();
+    notify_close_write(&fd);
+    if let Some(k) = key {
+        let pid = current().as_thread().proc_data.proc.pid();
+        crate::syscall::release_inode_posix_locks(pid, k);
+    }
+    drop(fd);
+    if let Some(k) = key {
+        crate::syscall::wake_lock_waiters(k);
+        crate::syscall::wake_flock_waiters(k);
+    }
+}
+
+/// Close all open file descriptors for the current process.
+///
+/// This must be called when a process exits, so that pipe write ends and other
+/// resources are properly released. Without this, parent processes blocking on
+/// pipe reads will never receive EOF.
+pub fn close_all_fds() {
+    // Acquire the write lock before checking strong_count. The clone(CLONE_FILES)
+    // path in syscall/task/clone.rs also acquires FD_TABLE.read() before cloning
+    // the Arc, creating a shared synchronization boundary. This ensures:
+    // - If close_all_fds acquires the write lock first, clone blocks on read lock
+    //   until we release, so strong_count cannot change during our check.
+    // - If clone holds the read lock first, we block on write lock, and by the
+    //   time we proceed strong_count already reflects the clone.
+    let mut table = FD_TABLE.write();
+
+    // CLONE_FILES may share the same fd table across multiple tasks/processes.
+    // In that case, an exiting sharer must not clear the whole table, or other
+    // live sharers (including the parent) will lose stdout/stderr unexpectedly.
+    if Arc::strong_count(&FD_TABLE) > 1 {
+        return;
+    }
+
+    let ids: alloc::vec::Vec<usize> = table.ids().collect();
+    let mut removed = alloc::vec::Vec::with_capacity(ids.len());
+    for id in ids {
+        match table.remove(id) {
+            Some(fd) => removed.push(fd),
+            None => warn!("close_all_fds: fd {id} disappeared during close sweep"),
+        }
+    }
+    drop(table);
+
+    // Snapshot inode keys before drop so we can wake F_SETLKW waiters
+    // afterwards: the Arc drops here may release OFD locks (their owner
+    // weak-refs go dead), and a parked waiter has no other way to learn
+    // about it. POSIX locks owned by this pid are released separately by
+    // `release_pid_locks`, which already wakes; the inode-key dedup
+    // means the per-inode wake is at most O(fds) and harmless when
+    // double-fired.
+    let lock_keys: alloc::vec::Vec<(u64, u64)> = removed
+        .iter()
+        .filter_map(|fd| fd.inner.inode_key())
+        .collect();
+    for fd in &removed {
+        notify_close_write(fd);
+    }
+    // Drop removed descriptors after releasing FD_TABLE lock to avoid
+    // lock re-entry or side effects from destructor paths.
+    drop(removed);
+    for key in lock_keys {
+        crate::syscall::wake_lock_waiters(key);
+        crate::syscall::wake_flock_waiters(key);
+    }
+    #[cfg(feature = "ebpf")]
+    {
+        crate::perf_event::perf_event_close_all();
+        crate::ebpf::bpf_close_all_fds();
+    }
 }
 
 pub fn add_stdio(fd_table: &mut FlattenObjects<FileDescriptor, AX_FILE_LIMIT>) -> AxResult<()> {
     assert_eq!(fd_table.count(), 0);
     let cx = FS_CONTEXT.lock();
-    let open = |options: &mut OpenOptions| {
+    let open = |options: &mut OpenOptions, flags| {
         AxResult::Ok(Arc::new(File::new(
             options.open(&cx, "/dev/console")?.into_file()?,
+            flags,
         )))
     };
 
-    let tty_in = open(OpenOptions::new().read(true).write(false))?;
-    let tty_out = open(OpenOptions::new().read(false).write(true))?;
+    let tty_in = open(OpenOptions::new().read(true).write(false), O_RDONLY as _)?;
+    let tty_out = open(OpenOptions::new().read(false).write(true), O_WRONLY as _)?;
     fd_table
         .add(FileDescriptor {
             inner: tty_in,

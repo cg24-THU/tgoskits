@@ -29,15 +29,6 @@ impl<'a> SocketSetWrapper<'a> {
         handle
     }
 
-    pub fn with_socket<T: AnySocket<'a>, R, F>(&self, handle: SocketHandle, f: F) -> R
-    where
-        F: FnOnce(&T) -> R,
-    {
-        let set = self.inner.lock();
-        let socket = set.get(handle);
-        f(socket)
-    }
-
     pub fn with_socket_mut<T: AnySocket<'a>, R, F>(&self, handle: SocketHandle, f: F) -> R
     where
         F: FnOnce(&mut T) -> R,
@@ -47,7 +38,7 @@ impl<'a> SocketSetWrapper<'a> {
         f(socket)
     }
 
-    pub fn bind_check(&self, addr: IpAddress, port: u16) -> AxResult {
+    pub fn udp_bind_check(&self, addr: IpAddress, port: u16) -> AxResult {
         if port == 0 {
             return Ok(());
         }
@@ -56,12 +47,6 @@ impl<'a> SocketSetWrapper<'a> {
         let mut sockets = self.inner.lock();
         for (_, socket) in sockets.iter_mut() {
             match socket {
-                Socket::Tcp(s) => {
-                    let local_addr = s.get_bound_endpoint();
-                    if local_addr.addr == Some(addr) && local_addr.port == port {
-                        return Err(AxError::AddrInUse);
-                    }
-                }
                 Socket::Udp(s) => {
                     if s.endpoint().addr == Some(addr) && s.endpoint().port == port {
                         return Err(AxError::AddrInUse);

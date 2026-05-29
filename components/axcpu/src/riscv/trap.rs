@@ -17,27 +17,32 @@ core::arch::global_asm!(
     trapframe_size = const core::mem::size_of::<TrapFrame>(),
 );
 
-fn handle_breakpoint(sepc: &mut usize) {
-    debug!("Exception(Breakpoint) @ {sepc:#x} ");
-    *sepc += 2
+fn handle_breakpoint(tf: &mut TrapFrame) {
+    debug!("Exception(Breakpoint) @ {:#x} ", tf.sepc);
+    if crate::trap::breakpoint_handler(tf) {
+        return;
+    }
+    tf.sepc += 2;
 }
 
 fn handle_page_fault(tf: &mut TrapFrame, access_flags: PageFaultFlags) {
     let vaddr = va!(stval::read());
-    if crate::trap::page_fault_handler(vaddr, access_flags) {
+    if crate::trap::call_page_fault_handler_with_parent_irqs(vaddr, access_flags, tf.sstatus.spie())
+    {
         return;
     }
-    #[cfg(feature = "uspace")]
+    #[cfg(feature = "exception-table")]
     if tf.fixup_exception() {
         return;
     }
+    let bt = tf.backtrace();
     panic!(
         "Unhandled Supervisor Page Fault @ {:#x}, fault_vaddr={:#x} ({:?}):\n{:#x?}\n{}",
         tf.sepc,
         vaddr,
         access_flags,
         tf,
-        tf.backtrace()
+        bt.kind("trap")
     );
 }
 
@@ -51,28 +56,30 @@ fn riscv_trap_handler(tf: &mut TrapFrame) {
             Trap::Exception(E::InstructionPageFault) => {
                 handle_page_fault(tf, PageFaultFlags::EXECUTE)
             }
-            Trap::Exception(E::Breakpoint) => handle_breakpoint(&mut tf.sepc),
+            Trap::Exception(E::Breakpoint) => handle_breakpoint(tf),
             Trap::Interrupt(_) => {
                 crate::trap::irq_handler(scause.bits());
             }
             _ => {
+                let bt = tf.backtrace();
                 panic!(
                     "Unhandled trap {:?} @ {:#x}, stval={:#x}:\n{:#x?}\n{}",
                     cause,
                     tf.sepc,
                     stval::read(),
                     tf,
-                    tf.backtrace()
+                    bt.kind("trap")
                 );
             }
         }
     } else {
+        let bt = tf.backtrace();
         panic!(
             "Unknown trap {:#x?} @ {:#x}:\n{:#x?}\n{}",
             scause.cause(),
             tf.sepc,
             tf,
-            tf.backtrace()
+            bt.kind("trap")
         );
     }
 

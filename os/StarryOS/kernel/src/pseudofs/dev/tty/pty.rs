@@ -1,6 +1,6 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 
-use ax_kspin::SpinNoPreempt;
+use ax_kspin::SpinNoIrq;
 use axpoll::PollSet;
 use ringbuf::{
     Cons, HeapRb, Prod,
@@ -36,11 +36,11 @@ impl TtyRead for PtyReader {
 }
 
 #[derive(Clone)]
-pub struct PtyWriter(Arc<SpinNoPreempt<Prod<Buffer>>>, Arc<PollSet>);
+pub struct PtyWriter(Arc<SpinNoIrq<Prod<Buffer>>>, Arc<PollSet>);
 
 impl PtyWriter {
     pub fn new(buffer: Buffer, poll_rx: Arc<PollSet>) -> Self {
-        Self(Arc::new(SpinNoPreempt::new(Prod::new(buffer))), poll_rx)
+        Self(Arc::new(SpinNoIrq::new(Prod::new(buffer))), poll_rx)
     }
 }
 
@@ -67,7 +67,7 @@ pub(crate) fn create_pty_pair() -> (Arc<PtyDriver>, Arc<PtyDriver>) {
         TtyConfig {
             reader: PtyReader::new(slave_to_master.clone()),
             writer: PtyWriter::new(master_to_slave.clone(), poll_rx_slave.clone()),
-            process_mode: ProcessMode::None(poll_rx_master.clone()),
+            process_mode: ProcessMode::Passive(poll_rx_master.clone()),
         },
     );
 
@@ -76,9 +76,7 @@ pub(crate) fn create_pty_pair() -> (Arc<PtyDriver>, Arc<PtyDriver>) {
         TtyConfig {
             reader: PtyReader::new(master_to_slave),
             writer: PtyWriter::new(slave_to_master, poll_rx_master),
-            process_mode: ProcessMode::External(Box::new(move |waker| {
-                poll_rx_slave.register(&waker)
-            })),
+            process_mode: ProcessMode::InterruptDriven(poll_rx_slave),
         },
     );
 

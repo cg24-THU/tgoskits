@@ -149,7 +149,7 @@ impl Reference {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TypeMap(SmallVec<[(TypeId, Arc<dyn Any + Send + Sync>); 2]>);
 impl TypeMap {
     pub fn new() -> Self {
@@ -244,7 +244,7 @@ impl DirEntry {
             node: Node::File(node),
             node_type,
             reference,
-            user_data: Mutex::default(),
+            user_data: Mutex::new(TypeMap::default()),
         }))
     }
 
@@ -253,7 +253,7 @@ impl DirEntry {
             node: Node::Dir(node_fn(WeakDirEntry(this.clone()))),
             node_type: NodeType::Directory,
             reference,
-            user_data: Mutex::default(),
+            user_data: Mutex::new(TypeMap::default()),
         }))
     }
 

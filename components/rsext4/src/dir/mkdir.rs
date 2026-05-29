@@ -100,7 +100,7 @@ fn mkdir_internal<B: BlockDevice>(
 
     {
         // Initialize `.` and `..`, leaving room for the checksum tail when enabled.
-        let cached = fs.datablock_cache.create_new(data_block);
+        let cached = fs.datablock_cache.create_new(device, data_block)?;
         let data = &mut cached.data;
 
         let dot_name = b".";
@@ -150,6 +150,7 @@ fn mkdir_internal<B: BlockDevice>(
     let (group_idx, _idx) = fs.inode_allocator.global_to_group(new_dir_ino)?;
     let dir_mode = Ext4Inode::S_IFDIR | 0o755;
     let mut new_inode = Ext4Inode::empty_for_reuse(fs.default_inode_extra_isize());
+    new_inode.i_generation = new_dir_gen;
     new_inode.i_links_count = 2;
     new_inode.i_size_lo = BLOCK_SIZE as u32;
     new_inode.i_size_high = 0;
@@ -159,7 +160,7 @@ fn mkdir_internal<B: BlockDevice>(
         dir_mode,
         parent_inode.i_flags & Ext4Inode::EXT4_FL_INHERITED,
     );
-    build_file_block_mapping(fs, &mut new_inode, &[data_block], device);
+    build_file_block_mapping_with_inode_num(fs, &mut new_inode, new_dir_ino, &[data_block], device);
     let mut create_update = Ext4InodeMetadataUpdate::create(dir_mode);
     if fs
         .superblock
